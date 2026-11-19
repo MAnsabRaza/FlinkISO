@@ -1,0 +1,8 @@
+# Turn rewriting on
+# Options +FollowSymLinks
+# RewriteEngine On
+# RewriteCond %{DOCUMENT_ROOT}/$2 -f [OR]
+# RewriteCond %{DOCUMENT_ROOT}/$2 -d
+# RewriteRule ^([a-z]{2})/(.+)$ /$2 [L,QSA]
+
+# RewriteRule . index.php [L]
