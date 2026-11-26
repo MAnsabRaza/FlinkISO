@@ -2,6 +2,8 @@
 App::uses('AppController', 'Controller');
 App::uses('Folder', 'Utility');
 App::uses('File', 'Utility');
+// Owner's fifth review (16 Nov 2026), decision 392: thrown inside a form-builder submit; the submit is then undone.
+if (!class_exists('M9BuilderAbort', false)) { class M9BuilderAbort extends Exception { } }
 /**
  * CustomTables Controller
  *
@@ -230,10 +232,12 @@ class CustomTablesController extends AppController {
         $file_name = $file_name . '.' . $file_type;
         $tableFile = WWW_ROOT .  'files' . DS . $this->Session->read('User.company_id') . DS . 'custom_tables' . DS . $id . DS . $file_name;
         if(!file_exists($tableFile)){
+            // Owner's fourth review (13 Nov 2026): this page copied the document's file into the form's folder on a GET whenever the
+            // form's copy was missing. Opening the page no longer writes any file. When the document's file exists, the page shows a
+            // button; the form's creator restores the copy by POST (restore_form_document, session token, administrator).
             $qcfile = WWW_ROOT .  'files' . DS . $this->Session->read('User.company_id') . DS . 'qc_documents' . DS . $qcDocument['QcDocument']['id'] . DS . $file_name;;
             if(file_exists($qcfile)){
-                // copy file
-                copy($qcfile,$tableFile);
+                $this->set('m9FormCopyMissing', true);
             }else{
                 $this->set('doc_not_found',true);
             }
@@ -270,15 +274,11 @@ class CustomTablesController extends AppController {
         $this->set('customTriggers',$customTriggers);
         $key = $this->_generate_onlyoffice_key($customTable['CustomTable']['id'] . date('Ymdhis'));
         $this->set('filekey', $key);
-        $updateTable = false;
-        if($customTable['CustomTable']['creators'] == null)$customTable['CustomTable']['creators'] = $qcDocument['QcDocument']['editors'];$updateTable = true;
-        if($customTable['CustomTable']['viewers'] == null)$customTable['CustomTable']['viewers'] = $qcDocument['QcDocument']['user_id'];$updateTable = true;
-        if($customTable['CustomTable']['editors'] == null)$customTable['CustomTable']['editors'] = $qcDocument['QcDocument']['editors'];$updateTable = true;
-        if($customTable['CustomTable']['approvers'] == null)$customTable['CustomTable']['approvers'] = $qcDocument['QcDocument']['editors'];$updateTable = true;
-        if($updateTable == true){
-            $this->CustomTable->create();
-            $this->CustomTable->save($customTable['CustomTable'],false);
-        }
+        // M9 review R1 (owner review 12 Nov 2026). FlinkISO saved the form here on every visit: each line above set $updateTable outside
+        // its "if", so the save ran whether or not an access list was empty, and rewrote the form's modification time and user on a
+        // GET. Opening this page no longer saves anything. A form whose access lists are empty keeps them empty until an administrator
+        // sets them with the access form on this page (custom_tables/updateaccess, POST with the session token); the page already
+        // shows the document's lists as the suggested values.
     }
     
     public function edit($id = null) {
@@ -378,157 +378,20 @@ class CustomTablesController extends AppController {
     }
 
     // 1st step add new table
+    // Owner's fifth review (16 Nov 2026), decision 392: the table work is collected here and applied at the end of the submit by
+    // _m9_tx_commit (CREATE if the table is missing, then the column changes as one ALTER). Outside a submit it does nothing.
     public function _add_new_table($table_name = null,$defaultfield = null,$sqld = null,$fields = null){
-        foreach($fields as $field){
-            $newFields[] = $field;
-        }
-        $fields = $newFields;
-        $sql = "CREATE TABLE IF NOT EXISTS `" . $table_name . "` ( ";
-        $sql .= "`id` varchar(36) NOT NULL ,";
-        $sql .= "`sr_no` int(11) NOT NULL AUTO_INCREMENT,";
-        $sql .= "`".$defaultfield."` varchar(255) NOT NULL,";
-        $sql .= $sqld;
-        $sql .= "
-        `file_id` varchar(36) NULL,
-        `file_key` varchar(50) NULL,
-        `parent_id` varchar(36) NULL,
-        `additional_files` text NULL,
-        `publish` tinyint(1) DEFAULT '1' COMMENT '0=Un 1=Pub',
-        `record_status` tinyint(1) DEFAULT '0' COMMENT '0=Un-locked, 1=Locked',
-        `status_user_id` varchar(36) DEFAULT NULL,
-        `approval_step_id` varchar(36) DEFAULT NULL,
-        `created_by` varchar(36) NOT NULL,
-        `created` datetime NOT NULL,
-        `modified_by` varchar(36) NOT NULL,
-        `approved_by` varchar(36) DEFAULT NULL,
-        `prepared_by` varchar(36) DEFAULT NULL,
-        `modified` datetime NOT NULL,
-        `soft_delete` tinyint(1) NOT NULL DEFAULT '0',
-        `branchid` varchar(36) DEFAULT NULL,
-        `departmentid` varchar(36) DEFAULT NULL,
-        `company_id` varchar(36) DEFAULT NULL,
-        PRIMARY KEY (`id`),
-        KEY `sr_no` (`sr_no`)
-        ) ENGINE=MyISAM AUTO_INCREMENT=1 DEFAULT CHARSET=utf8;
-        ";
-
-        if($this->CustomTable->query($sql)){
-
-        }else{
-            $this->Session->setFlash(__('Something went wrong'), 'default', array('class' => 'alert alert-danger'));
-            $this->redirect($this->referer());
-        }
-        // run above sql first and then add alter table commands one by one
-        foreach ($fields as $chkd) {            
-            if($chkd['new'] == 0 && $chkd['field_name'] != $chkd['old_field_name']){
-                switch ($chkd['field_type']) {
-                    case 0: // varchar
-                    $type = 'varchar('.$chkd['length'].')';
-                    break;
-                    case 1: // text
-                    $type = 'text';
-                    break;
-                    case 2: // int
-                    $type = 'int('.$chkd['length'].')';
-                    break;
-                    case 3: // tinyint
-                    $type = 'tinyint('.$chkd['length'].')';
-                    break;
-                    case 4: // float
-                    $type = 'float('.$chkd['length'].')';
-                    break;
-                    case 5: // date
-                    $type = 'date';
-                    break;
-                    case 6: // datetime
-                    $type = 'datetime';
-                    break;
-                    case 7: // datetime
-                    $type = 'varchar('.$chkd['length'].')';
-                    break;
-                default: // text
-                $type = 'text';
-                break;
-            }
-
-            if($chkd['mandetory'] == 1)$m = ' NOT ';
-            else $m = '';
-
-            if(!in_array($chkd['field_name'],$this->reserved_fields))$updatesql .= 'ALTER TABLE `'.$this->request->data['CustomTable']['table_name'].'` CHANGE `'.$chkd['old_field_name'].'` `'.$chkd['field_name'].'` '.$type. ' '. $m.' NULL;';
-        }
-
-        if($chkd['drop'] == 1){
-            if(!in_array($chkd['field_name'],$this->reserved_fields))$dropsql .= 'ALTER TABLE `'.$this->request->data['CustomTable']['table_name'].'` DROP `'.$chkd['field_name'].'`;';
-        }
-
-        if($chkd['new'] == 1){
-            switch ($chkd['field_type']) {
-            case 0: // varchar
-            $type = 'varchar('.$chkd['length'].')';
-            break;
-            case 1: // text
-            $type = 'text';
-            break;
-            case 2: // int
-            $type = 'int('.$chkd['length'].')';
-            break;
-            case 3: // tinyint
-            $type = 'tinyint('.$chkd['length'].')';
-            break;
-            case 4: // float
-            $type = 'float('.$chkd['length'].')';
-            break;
-            case 5: // date
-            $type = 'date';
-            break;
-            case 6: // datetime
-            $type = 'datetime';
-            break;
-            default: // text
-            $type = 'text';
-            break;
-            case 7: // datetime
-            $type = 'varchar('.$chkd['length'].')';
-            break;
-        }
-
-        if($chkd['mandetory'] == 1)$m = ' NOT ';
-        else $m = '';
-        if($chkd['display_type'] != 7 && $chkd['display_type'] != 5){
-            if(!in_array($chkd['field_name'],$this->reserved_fields)){
-                $addsqls[] =  'ALTER TABLE `'.$this->request->data['CustomTable']['table_name'].'` ADD `'.$chkd['field_name'].'` '.$type.' '. $m .' NULL AFTER `sr_no`;';
-            }
-        }
+        if (!is_array($this->m9Tx)) { $this->_m9_ac_log('builder_ddl_outside_submit', substr(preg_replace('/[^A-Za-z0-9_]/', '', (string)$table_name), 0, 64)); throw new M9BuilderAbort('ddl_outside_submit'); }
+        $alter = isset($this->request->data['CustomTable']['table_name']) ? (string)$this->request->data['CustomTable']['table_name'] : '';
+        foreach (array((string)$table_name, $alter) as $tn) if (preg_match('/^(tbl|chd)_[a-z0-9_]{1,60}$/', $tn) !== 1) throw new M9BuilderAbort('bad_table_name');
+        if (preg_match('/^[A-Za-z0-9_]{1,64}$/', (string)$defaultfield) !== 1) throw new M9BuilderAbort('bad_default_field');
+        $sqld = (string)$sqld;
+        if ($sqld !== '' && preg_match("/^(\\s*`(qc_document_id|process_id|custom_table_id)` varchar\\(36\\) (NOT NULL DEFAULT '[0-9a-f-]{36}'|NULL'?),)+\\s*$/i", $sqld) !== 1) throw new M9BuilderAbort('bad_table_definition');
+        $list = array();
+        foreach ((array)$fields as $f) if (is_array($f)) $list[] = $f;
+        $this->m9Tx['ddl'][] = array('create' => (string)$table_name, 'default' => (string)$defaultfield, 'sqld' => $sqld, 'alter' => $alter, 'fields' => $list);
+        return true;
     }
-}
-
-    if($updatesql){
-        try{
-            $this->CustomTable->query($updatesql);
-        }catch(Exception $e){
-            
-        }
-    }
-
-    if($dropsql){
-        try{
-            $this->CustomTable->query($dropsql);
-        }catch(Exception $e){
-            
-        }
-    }
-
-    if($addsqls){
-        foreach($addsqls as $addsql){
-            try{
-            $this->CustomTable->query($addsql);
-            }catch(Exception $e){
-               
-            }
-        }
-    }
-    return true;
-}
     /**
      * add method
      *
@@ -578,6 +441,8 @@ class CustomTablesController extends AppController {
         
         // after form submit
         if ($this->request->is('post')) {
+            if (false === $this->_m9_generator_ready()) $this->_m9_generator_refuse(); // owner's fourth review: no change unless the generator answers
+            $this->_m9_tx_begin(); // owner's fifth review (decision 392): from here this submit changes everything or nothing
             
             $this->_commons($this->Session->read('User.id'));
             
@@ -683,10 +548,11 @@ class CustomTablesController extends AppController {
                     $pathfolder = new Folder();
                     // create folder
                     if ($pathfolder->create(Configure::read('path') . DS . $this->CustomTable->id)) {
-                        chmod(Configure::read('path') . DS . $this->CustomTable->id,0777);
+                        $this->_m9_mode(Configure::read('path') . DS . $this->CustomTable->id);
+                        $this->_m9_tx_note_created(Configure::read('path') . DS . $this->CustomTable->id);
                         
                         if(file_exists($qcpfile)){
-                            if (copy($qcpfile, $file)) {
+                            if (($m9c = $this->_m9_safe_copy(Configure::read('path'), $this->CustomTable->id, basename($file), $qcpfile)) && $m9c[0] && $this->_m9_tx_note_created($m9c[1])) {
                                 $key = $this->_generate_onlyoffice_key($this->CustomTable->id . date('Ymdhis'));
                                 $this->set('file_key', $key);
 
@@ -721,6 +587,7 @@ class CustomTablesController extends AppController {
 
                         $result = $this->curl('post','custom_forms', 'create',$data);
                         $result = json_decode($result,true);
+                        $this->_m9_tx_check_answer($result, 'create'); // decision 392: the whole answer is checked before it is used
                         
                         if($result['error'] == 1){
                             echo "Something went wrong. Please try again";
@@ -743,11 +610,9 @@ class CustomTablesController extends AppController {
 
                             $viewCode = json_decode($result['viewFile'],true);
 
-                            chmod(APP . 'View', 0777);
                             $folder = APP . 'View' . DS . Inflector::pluralize(Inflector::classify($table_name));        
                             $modelFolder = new Folder();
-                            $modelFolder->create($folder);
-                            chmod($folder, 0777);
+                            $this->_m9_mode($folder);
 
                             if($viewCode['index']){
                                 $file = $folder . DS . 'index.ctp';
@@ -776,9 +641,12 @@ class CustomTablesController extends AppController {
                         }
 
                         $sqlresult = $this->_add_new_table($table_name,$defaultfield,$sqld,$this->request->data['CustomTableFields']);
+                        $this->_m9_approval_begin();
+                        if ($this->_show_approvals() && !$this->_save_approvals($this->CustomTable->id)) throw new M9BuilderAbort('approval_save_failed');
+                        $this->_m9_tx_commit(); // decision 392: files, then the table; on failure all is undone
+                        $this->_m9_approval_commit(); // mail leaves only after the form commit succeeded
                         // $this->_clear_cake_cache();
                         // everything run properly -- now create table
-                        if ($this->_show_approvals()) $this->_save_approvals($this->CustomTable->id);
                         $this->Session->setFlash(__('Form created'));
                         $this->redirect(array('action' => 'recreate',$this->CustomTable->id, 'qc_document_id' => $this->request->params['named']['qc_document_id'],'process_id' => $this->request->params['named']['process_id']));
                         
@@ -851,6 +719,544 @@ class CustomTablesController extends AppController {
         }        
     }
 
+    // Owner's fourth review (13 Nov 2026): restores a form's copy of its document, the copy custom_tables/view used to make on a
+    // GET. POST only (the session token is checked for every POST), administrator (list in AppController), the form's creator
+    // (the rule of the view page). The source must be the form's own document file inside files/<company>/qc_documents/<document>/,
+    // the target inside files/<company>/custom_tables/<form>/, both after resolving links and '..'; an existing copy is never
+    // overwritten. Every outcome is logged.
+    public function restore_form_document($id = null) {
+        $k = 'custom_tables/restore_form_document';
+        if (false === $this->request->is('post')) $this->_m9_ac_refuse('post_required', $k);
+        if ($this->Session->read('User.is_mr') == false) $this->_m9_ac_refuse('admin_required', $k);
+        if (!is_string($id) || !preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $id)) $this->_m9_ac_refuse('bad_id', $k);
+        $customTable = $this->CustomTable->find('first', array('recursive' => -1, 'conditions' => array('CustomTable.id' => $id)));
+        if (!$customTable) $this->_m9_ac_refuse('form_not_found', $k);
+        $id = (string)$customTable['CustomTable']['id']; // the stored id, not the text of the address
+        if ($customTable['CustomTable']['created_by'] != $this->Session->read('User.id')) $this->_m9_ac_refuse('not_form_creator', $k);
+        $back = array('action' => 'view', $id);
+        $qcDocument = $this->_qc_document_header($customTable['CustomTable']['qc_document_id']);
+        if (empty($qcDocument['QcDocument']['id'])) { $this->_m9_ac_log('form_document_not_restored', $id . ' no_document'); $this->Session->setFlash(__('This form has no document.')); $this->redirect($back); }
+        $file_name = $this->_clean_table_names($qcDocument['QcDocument']['document_number'] . '-' . $qcDocument['QcDocument']['title'] . '-' . $qcDocument['QcDocument']['revision_number']) . '.' . $qcDocument['QcDocument']['file_type'];
+        $base = realpath(WWW_ROOT . 'files' . DS . $this->Session->read('User.company_id'));
+        $src = ($base === false) ? false : realpath($base . DS . 'qc_documents' . DS . $qcDocument['QcDocument']['id'] . DS . $file_name);
+        if ($src === false || !is_file($src) || strpos($src, $base . DS . 'qc_documents' . DS . $qcDocument['QcDocument']['id'] . DS) !== 0) {
+            $this->_m9_ac_log('form_document_not_restored', $id . ' source_missing'); $this->Session->setFlash(__('The document file was not found; nothing was changed.')); $this->redirect($back);
+        }
+        // owner's fifth review (decision 393): the copy goes through _m9_safe_copy, which never writes through a symbolic link
+        $m9c = $this->_m9_safe_copy($base, 'custom_tables/' . $id, basename($src), $src, false);
+        if (!$m9c[0] && $m9c[1] === 'already_present') { $this->_m9_ac_log('form_document_not_restored', $id . ' already_present'); $this->Session->setFlash(__('The form document is already present; nothing was changed.')); $this->redirect($back); }
+        if (!$m9c[0]) { $this->_m9_ac_log('form_document_not_restored', $id . ' ' . $m9c[1]); $this->Session->setFlash(__('The form document could not be restored; nothing was copied.')); $this->redirect($back); }
+        $dst = $m9c[1];
+        $this->_m9_ac_log('form_document_restored', $id . ' ' . basename($dst));
+        $this->Session->setFlash(__('The form document was restored from the document.'));
+        $this->redirect($back);
+    }
+
+    // ===== Owner's fifth review (16 Nov 2026), decision 392: a form-builder submit changes everything or nothing =====
+    // add, add_child, recreate, recreate_child and create_master save the form definition, ask the vendor's generator for the
+    // form's code, write that code into app/Controller, app/Model and app/View, and create or alter the form's table. Asking the
+    // generator first (fourth review) did not make the rest safe: a failure later in the submit still left part of it done.
+    // From the start of a submit (_m9_tx_begin):
+    //  - every row the submit writes to custom_tables, approval_processes or qc_documents is journalled by AppModel (decision 397,
+    //    owner's sixth review): the row before this submit first wrote it and the row as this submit left it; nothing else is kept;
+    //  - generated files and table changes are only collected, not applied (_write_to_file, _add_new_table, create_master);
+    //  - the generator's answer is checked in full before it is used: every expected part present, every generated PHP file parses;
+    //  - only at the end of a successful submit (_m9_tx_commit): each file is written beside its target and read back, the files
+    //    it replaces are kept under tmp/m9_builder/<id>/, the new files are renamed into place, and then the table is created if
+    //    missing and changed by ONE ALTER statement (all column changes apply or none), and its columns are read back and compared;
+    //  - on any failure (generator error, incomplete answer, a refused or failed step, a redirect or exit before the end, a fatal
+    //    error), everything the submit did is undone (_m9_tx_rollback): only the journalled rows, each only while it is still as
+    //    this submit left it (a row another user changed meanwhile is kept as they made it and reported), files put back, folders
+    //    it made removed, a table it created dropped while still empty.
+    // Outcomes are logged to tmp/logs/m9_access.log: builder_committed, builder_rolled_back, builder_rollback_incomplete.
+    // Generated files may only be form files (Tbl*/Chd* controllers, models and view folders); generated tables only tbl_/chd_.
+    public $m9Tx = null;
+    public $m9TxLock = '';
+    public $m9TxShutdown = false;
+
+    public function invokeAction(CakeRequest $request) {
+        // recreate and recreate_child take their skip/data arguments only from recreate_all_forms, never from the address
+        if (isset($request->params['action']) && in_array($request->params['action'], array('recreate', 'recreate_child'), true) && isset($request->params['pass'])) {
+            $request->params['pass'] = array_slice((array)$request->params['pass'], 0, 1);
+        }
+        try {
+            $r = parent::invokeAction($request);
+        } catch (M9BuilderAbort $e) {
+            $this->_m9_tx_rollback($e->getMessage(), true);
+            if ($this->request->is('ajax')) { $this->response->statusCode(409); $this->response->body(__('The form was not changed.')); $this->response->send(); $this->_stop(); }
+            return $this->redirect(array('action' => 'index'));
+        } catch (Throwable $e) {
+            $this->_m9_tx_rollback('error ' . get_class($e), true);
+            throw $e;
+        }
+        if (is_array($this->m9Tx)) $this->_m9_tx_rollback('ended_before_commit');
+        return $r;
+    }
+
+    public function redirect($url, $status = null, $exit = true) {
+        if (is_array($this->m9Tx)) $this->_m9_tx_rollback('ended_before_commit');
+        return parent::redirect($url, $status, $exit);
+    }
+
+    public function _m9_tx_shutdown() {
+        if (is_array($this->m9Tx)) { try { $this->_m9_tx_rollback('request_ended'); } catch (Throwable $e) { } }
+        elseif ($this->m9TxLock !== '') { try { $this->_m9_tx_release_builder(); } catch (Throwable $e) { } }
+    }
+
+    protected function _m9_tx_pdo() {
+        return ConnectionManager::getDataSource('default')->getConnection();
+    }
+
+    protected function _m9_tx_name($m) {
+        $t = (string)$m->tablePrefix . (string)$m->table;
+        if (preg_match('/^[A-Za-z0-9_]{1,64}$/', $t) !== 1) throw new M9BuilderAbort('bad_table_name');
+        return $t;
+    }
+
+    // M9 full fix: serialise every builder submit on this database. Form builder writes the same
+    // generated files and the same definition rows; a second submit must wait (or be refused) instead
+    // of interleaving its journal, file backups and DDL with the first one.
+    protected function _m9_lock_acquire($name, $timeout = 10) {
+        if (preg_match('/^[A-Za-z0-9_]{1,64}$/', (string)$name) !== 1) return false;
+        try {
+            $q = $this->_m9_tx_pdo()->prepare('SELECT GET_LOCK(?, ?)');
+            $q->execute(array((string)$name, max(1, (int)$timeout)));
+            return ((string)$q->fetchColumn() === '1');
+        } catch (Throwable $e) { return false; }
+    }
+
+    protected function _m9_lock_release($name) {
+        if (!is_string($name) || $name === '') return;
+        try {
+            $q = $this->_m9_tx_pdo()->prepare('SELECT RELEASE_LOCK(?)');
+            $q->execute(array($name));
+        } catch (Throwable $e) { }
+    }
+
+    protected function _m9_tx_unlock_files($tx) {
+        if (!is_array($tx) || empty($tx['fileLocks'])) return;
+        foreach ($tx['fileLocks'] as $lock) $this->_m9_file_unlock($lock);
+    }
+
+    protected function _m9_tx_release_builder() {
+        $this->_m9_lock_release($this->m9TxLock);
+        $this->m9TxLock = '';
+    }
+
+    public function _m9_tx_begin() {
+        if (is_array($this->m9Tx)) throw new M9BuilderAbort('nested_submit');
+        if ($this->m9TxLock !== '') throw new M9BuilderAbort('nested_submit');
+        $lock = 'm9_builder';
+        if (false === $this->_m9_lock_acquire($lock, 10)) throw new M9BuilderAbort('builder_busy');
+        $this->m9TxLock = $lock;
+        try {
+            $this->loadModel('ApprovalProcess');
+            $this->loadModel('Approval');
+            // decision 397: from here AppModel journals every row this request writes to these tables; nothing is read in advance
+            AppModel::m9_journal_start(array($this->_m9_tx_name($this->CustomTable), $this->_m9_tx_name($this->ApprovalProcess), $this->_m9_tx_name($this->Approval), $this->_m9_tx_name($this->CustomTable->QcDocument)));
+            $this->m9Tx = array('id' => date('Ymd_His') . '_' . bin2hex(random_bytes(3)), 'action' => (string)$this->action,
+                'files' => array(), 'ddl' => array(), 'made' => array(), 'noted' => array(), 'stage' => array(), 'created' => array(),
+                'fileLocks' => array(), 'shadow' => array(), 'answer' => '', 'done' => false, 'user' => (string)$this->Session->read('User.id'));
+        } catch (Throwable $e) {
+            $this->_m9_lock_release($lock);
+            $this->m9TxLock = '';
+            throw $e;
+        }
+        if (false === $this->m9TxShutdown) { $this->m9TxShutdown = true; register_shutdown_function(array($this, '_m9_tx_shutdown')); }
+        return true;
+    }
+
+    // A file or folder the submit itself made outside the form folders (the form's document copy in add): removed on undo.
+    public function _m9_tx_note_created($path) {
+        if (is_array($this->m9Tx)) $this->m9Tx['noted'][] = (string)$path;
+        return true;
+    }
+
+    // Called by AppController::_write_to_file during a submit.
+    public function _m9_tx_queue_file($file, $content) {
+        if (!is_array($this->m9Tx)) throw new M9BuilderAbort('no_transaction');
+        $file = (string)$file; $content = (string)$content; $app = rtrim(APP, DS);
+        $rel = (strpos($file, $app . DS) === 0) ? str_replace(DS, '/', substr($file, strlen($app) + 1)) : '';
+        if (preg_match('#^(Controller/(Tbl|Chd)[A-Za-z0-9]+Controller\.php|Model/(Tbl|Chd)[A-Za-z0-9]+\.php|View/(Tbl|Chd)[A-Za-z0-9]+/[A-Za-z0-9_]+\.ctp)$#', $rel) !== 1) {
+            throw new M9BuilderAbort('generated_file_not_a_form_file ' . substr(preg_replace('/[^A-Za-z0-9_.\/-]/', '', $rel), 0, 80));
+        }
+        try { token_get_all($content, TOKEN_PARSE); } catch (ParseError $e) { throw new M9BuilderAbort('generated_code_does_not_parse ' . $rel . ' line ' . $e->getLine()); }
+        $this->m9Tx['files'][$rel] = $content;
+        return true;
+    }
+
+    // The generator's answer, checked in full before the vendor code reads it.
+    public function _m9_tx_check_answer($r, $kind) {
+        if (!is_array($this->m9Tx)) throw new M9BuilderAbort('no_transaction');
+        if (!is_array($r) || (isset($r['error']) && $r['error'] == 1) || !isset($r['response']['finalResult']) || !is_string($r['response']['finalResult'])) throw new M9BuilderAbort('generator_error');
+        $f = json_decode($r['response']['finalResult'], true);
+        if (!is_array($f)) throw new M9BuilderAbort('generator_answer_unreadable');
+        $j = function ($k) use ($f) { if (!isset($f[$k]) || !is_string($f[$k])) return null; $d = json_decode($f[$k], true); return is_array($d) ? $d : null; };
+        $s = function ($a, $k) { return is_array($a) && isset($a[$k]) && is_string($a[$k]) && trim($a[$k]) !== ''; };
+        $ok = false;
+        if ($kind === 'create') {
+            $v = $j('viewFile'); $a = $j('formFile');
+            $ok = $s($f, 'controller') && $s($f, 'model') && $s($v, 'index') && $s($v, 'view') && $s($a, 'add') && $s($a, 'edit');
+        } elseif ($kind === 'create_child') {
+            $a = $j('formFile');
+            $ok = $s($f, 'controller') && $s($f, 'model') && $s($f, 'index') && is_array($a) && count($a) > 0;
+            if ($ok) foreach ($a as $k => $c) if (!is_string($k) || preg_match('/^[A-Za-z0-9_]+$/', $k) !== 1 || !is_string($c) || trim($c) === '') $ok = false;
+        } elseif ($kind === 'create_masters') {
+            $c = $j('controller_model'); $v = $j('viewFile'); $a = $j('formFile');
+            $ok = $s($c, 'controller') && $s($c, 'model') && $s($v, 'index') && $s($v, 'view') && $s($a, 'add') && $s($a, 'edit');
+        }
+        if (!$ok) throw new M9BuilderAbort('generator_answer_incomplete');
+        $this->m9Tx['answer'] = $kind;
+        return true;
+    }
+
+    // FlinkISO's CREATE statement for a form table (unchanged text, from _add_new_table).
+    protected function _m9_tx_create_sql($table_name, $defaultfield, $sqld) {
+        $sql = "CREATE TABLE IF NOT EXISTS `" . $table_name . "` ( ";
+        $sql .= "`id` varchar(36) NOT NULL ,";
+        $sql .= "`sr_no` int(11) NOT NULL AUTO_INCREMENT,";
+        $sql .= "`".$defaultfield."` varchar(255) NOT NULL,";
+        $sql .= $sqld;
+        $sql .= "
+        `file_id` varchar(36) NULL,
+        `file_key` varchar(50) NULL,
+        `parent_id` varchar(36) NULL,
+        `additional_files` text NULL,
+        `publish` tinyint(1) DEFAULT '1' COMMENT '0=Un 1=Pub',
+        `record_status` tinyint(1) DEFAULT '0' COMMENT '0=Un-locked, 1=Locked',
+        `status_user_id` varchar(36) DEFAULT NULL,
+        `approval_step_id` varchar(36) DEFAULT NULL,
+        `created_by` varchar(36) NOT NULL,
+        `created` datetime NOT NULL,
+        `modified_by` varchar(36) NOT NULL,
+        `approved_by` varchar(36) DEFAULT NULL,
+        `prepared_by` varchar(36) DEFAULT NULL,
+        `modified` datetime NOT NULL,
+        `soft_delete` tinyint(1) NOT NULL DEFAULT '0',
+        `branchid` varchar(36) DEFAULT NULL,
+        `departmentid` varchar(36) DEFAULT NULL,
+        `company_id` varchar(36) DEFAULT NULL,
+        PRIMARY KEY (`id`),
+        KEY `sr_no` (`sr_no`)
+        ) ENGINE=MyISAM AUTO_INCREMENT=1 DEFAULT CHARSET=utf8;
+        ";
+        return $sql;
+    }
+
+    public function _m9_tx_queue_create($table, $sql) {
+        if (!is_array($this->m9Tx)) throw new M9BuilderAbort('no_transaction');
+        if (preg_match('/^(tbl|chd)_[a-z0-9_]{1,60}$/', (string)$table) !== 1) throw new M9BuilderAbort('bad_table_name');
+        $this->m9Tx['ddl'][] = array('create' => (string)$table, 'raw_create' => (string)$sql, 'alter' => '', 'fields' => array());
+        return true;
+    }
+
+    protected function _m9_tx_table_exists($t) {
+        $q = $this->_m9_tx_pdo()->prepare('SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?');
+        $q->execute(array($t));
+        return (int)$q->fetchColumn() > 0;
+    }
+
+    protected function _m9_tx_columns($t) {
+        if (!$this->_m9_tx_table_exists($t)) throw new M9BuilderAbort('table_missing ' . $t);
+        $out = array();
+        foreach ($this->_m9_tx_pdo()->query('SHOW COLUMNS FROM `' . $t . '`')->fetchAll(PDO::FETCH_ASSOC) as $c) $out[$c['Field']] = true;
+        return $out;
+    }
+
+    protected function _m9_tx_ddl_run($sql, $what) {
+        AppModel::$m9Ddl++;
+        try { $r = $this->CustomTable->query($sql); } catch (Exception $e) { $r = false; } finally { AppModel::$m9Ddl--; }
+        if ($r === false) throw new M9BuilderAbort('table_statement_failed ' . $what);
+        return true;
+    }
+
+    protected function _m9_tx_type($f) {
+        $t = isset($f['field_type']) ? (string)$f['field_type'] : ''; $len = isset($f['length']) ? (string)$f['length'] : '';
+        $sized = array('0' => 'varchar', '2' => 'int', '3' => 'tinyint', '4' => 'float', '7' => 'varchar');
+        if (isset($sized[$t])) {
+            if (preg_match('/^[1-9][0-9]{0,4}$/', $len) !== 1) throw new M9BuilderAbort('bad_field_length');
+            return $sized[$t] . '(' . $len . ')';
+        }
+        if ($t === '1') return 'text';
+        if ($t === '5') return 'date';
+        if ($t === '6') return 'datetime';
+        return 'text';
+    }
+
+    protected function _m9_tx_ident($n) {
+        if (preg_match('/^[A-Za-z0-9_]{1,64}$/', (string)$n) !== 1) throw new M9BuilderAbort('bad_field_name');
+        return (string)$n;
+    }
+
+    // The column changes FlinkISO's _add_new_table asked for, as one list, against the table as it is. FlinkISO issued one
+    // statement per change and ignored the ones the database refused (dropping a column that is not there, adding one that is);
+    // those are not issued here, so the one ALTER does exactly what FlinkISO's statements that succeeded did.
+    protected function _m9_tx_plan($cols, $lists) {
+        $clauses = array(); $expect = array();
+        foreach ($lists as $fields) foreach ($fields as $f) {
+            $name = isset($f['field_name']) ? (string)$f['field_name'] : '';
+            if ($name === '' || in_array($name, $this->reserved_fields, true)) continue;
+            $old = isset($f['old_field_name']) ? (string)$f['old_field_name'] : '';
+            $drop = isset($f['drop']) && $f['drop'] == 1; $new = isset($f['new']) && $f['new'] == 1;
+            $null = (isset($f['mandetory']) && $f['mandetory'] == 1) ? 'NOT NULL' : 'NULL';
+            if ($drop) {
+                foreach (array($name, $old) as $n) if ($n !== '' && isset($cols[$n]) && !in_array($n, $this->reserved_fields, true)) {
+                    $clauses[] = 'DROP `' . $this->_m9_tx_ident($n) . '`'; unset($cols[$n]); $expect[$n] = false; break;
+                }
+                continue;
+            }
+            if (!$new && $old !== '' && $old !== $name && isset($cols[$old]) && !isset($cols[$name])) {
+                $clauses[] = 'CHANGE `' . $this->_m9_tx_ident($old) . '` `' . $this->_m9_tx_ident($name) . '` ' . $this->_m9_tx_type($f) . ' ' . $null;
+                unset($cols[$old]); $cols[$name] = true; $expect[$old] = false; $expect[$name] = true;
+            }
+            $dt = isset($f['display_type']) ? (string)$f['display_type'] : '';
+            if ($new && !isset($cols[$name]) && $dt !== '5' && $dt !== '7') {
+                $clauses[] = 'ADD `' . $this->_m9_tx_ident($name) . '` ' . $this->_m9_tx_type($f) . ' ' . $null . ' AFTER `sr_no`';
+                $cols[$name] = true; $expect[$name] = true;
+            }
+        }
+        return array($clauses, $expect);
+    }
+
+    protected function _m9_tx_shadow_name($t, $tag = 's') {
+        return 'm9' . $tag . '_' . substr(sha1($t . '|' . $this->m9Tx['id'] . '|' . $tag), 0, 24);
+    }
+
+    protected function _m9_tx_drop($t, $why) {
+        try {
+            if ($this->_m9_tx_table_exists($t)) $this->_m9_tx_ddl_run('DROP TABLE `' . $t . '`', $why . ' ' . $t);
+            return true;
+        } catch (Throwable $e) { return false; }
+    }
+
+    // The rows of the original table are copied into the empty shadow table. If anything changes
+    // while the copy is in progress the row count/checksum differs and the submit stops before the
+    // original schema or data is touched.
+    protected function _m9_tx_copy_rows($from, $to) {
+        $a = $this->_m9_tx_columns($from); $b = $this->_m9_tx_columns($to);
+        $common = array();
+        foreach (array_keys($a) as $c) if (isset($b[$c])) $common[] = '`' . str_replace('`', '', $c) . '`';
+        if (!$common) throw new M9BuilderAbort('no_common_columns ' . $from);
+        $this->_m9_tx_ddl_run('INSERT INTO `' . $to . '` (' . implode(', ', $common) . ') SELECT ' . implode(', ', $common) . ' FROM `' . $from . '`', 'copy ' . $from . ' to ' . $to);
+        $pdo = $this->_m9_tx_pdo();
+        $n1 = (int)$pdo->query('SELECT COUNT(*) FROM `' . $from . '`')->fetchColumn();
+        $n2 = (int)$pdo->query('SELECT COUNT(*) FROM `' . $to . '`')->fetchColumn();
+        if ($n1 !== $n2) throw new M9BuilderAbort('row_count_changed ' . $from);
+        $c1 = $pdo->query('CHECKSUM TABLE `' . $from . '`')->fetch(PDO::FETCH_ASSOC);
+        $c2 = $pdo->query('CHECKSUM TABLE `' . $to . '`')->fetch(PDO::FETCH_ASSOC);
+        if (is_array($c1) && is_array($c2) && isset($c1['Checksum'], $c2['Checksum']) && $c1['Checksum'] !== null && $c2['Checksum'] !== null && (string)$c1['Checksum'] !== (string)$c2['Checksum']) {
+            throw new M9BuilderAbort('row_checksum_changed ' . $from);
+        }
+        return true;
+    }
+
+    // DDL is applied to an empty shadow table. The original table is replaced by one atomic
+    // RENAME only after the shadow has the expected columns and its copied rows match. A failure
+    // before the rename leaves the original schema and data untouched; a failure after it is
+    // undone by restoring the retained original table (see _m9_tx_rollback).
+    protected function _m9_tx_apply_ddl() {
+        $sum = array();
+        foreach ($this->m9Tx['ddl'] as $p) {
+            $t = $p['create'];
+            if ($this->_m9_tx_table_exists($t)) continue;
+            $sql = isset($p['raw_create']) ? $p['raw_create'] : $this->_m9_tx_create_sql($t, $p['default'], $p['sqld']);
+            $this->m9Tx['created'][] = $t; // recorded first: if the statement ran but reports failure, undo still looks for it
+            $this->_m9_tx_ddl_run($sql, 'create ' . $t);
+            if (!$this->_m9_tx_table_exists($t)) throw new M9BuilderAbort('table_not_created ' . $t);
+            $sum[] = 'create:' . $t;
+        }
+        $byTable = array();
+        foreach ($this->m9Tx['ddl'] as $p) if ($p['alter'] !== '' && !empty($p['fields'])) $byTable[$p['alter']][] = $p['fields'];
+        foreach ($byTable as $t => $lists) {
+            $before = $this->_m9_tx_columns($t);
+            list($clauses, $expect) = $this->_m9_tx_plan($before, $lists);
+            if (!$clauses) continue;
+            $shadow = $this->_m9_tx_shadow_name($t, 's');
+            $backup = $this->_m9_tx_shadow_name($t, 'b');
+            $this->_m9_tx_drop($shadow, 'stale shadow');
+            $this->_m9_tx_drop($backup, 'stale backup');
+            $this->m9Tx['shadow'][$t] = array('shadow' => $shadow, 'backup' => $backup, 'done' => false);
+            try {
+                $this->_m9_tx_ddl_run('CREATE TABLE `' . $shadow . '` LIKE `' . $t . '`', 'shadow create ' . $t);
+                $this->_m9_tx_ddl_run('ALTER TABLE `' . $shadow . '` ' . implode(', ', $clauses), 'shadow alter ' . $t);
+                $after = $this->_m9_tx_columns($shadow); $hit = 0;
+                foreach ($expect as $c => $present) if (isset($after[$c]) === $present) $hit++;
+                if ($hit !== count($expect)) throw new M9BuilderAbort('table_not_as_expected ' . $t);
+                $this->_m9_tx_copy_rows($t, $shadow);
+                $this->_m9_tx_ddl_run('RENAME TABLE `' . $t . '` TO `' . $backup . '`, `' . $shadow . '` TO `' . $t . '`', 'shadow rename ' . $t);
+                $this->m9Tx['shadow'][$t]['done'] = true;
+                if (!$this->_m9_tx_table_exists($t) || !$this->_m9_tx_table_exists($backup) || $this->_m9_tx_table_exists($shadow)) throw new M9BuilderAbort('table_rename_failed ' . $t);
+                $sum[] = 'alter:' . $t . ':' . count($clauses);
+            } catch (Throwable $e) {
+                if (!$this->m9Tx['shadow'][$t]['done']) $this->_m9_tx_drop($shadow, 'shadow cleanup ' . $t);
+                elseif ($this->_m9_tx_table_exists($backup) && $this->_m9_tx_table_exists($t) && !$this->_m9_tx_table_exists($shadow)) $this->m9Tx['shadow'][$t]['done'] = true;
+                throw $e;
+            }
+        }
+        return $sum ? implode(',', $sum) : 'none';
+    }
+
+    protected function _m9_tx_restore_shadow($t, $state, &$bad, &$undone) {
+        $shadow = $state['shadow']; $backup = $state['backup'];
+        try {
+            if ($state['done']) {
+                $quarantine = $this->_m9_tx_shadow_name($t, 'q');
+                $this->_m9_tx_drop($quarantine, 'stale quarantine');
+                $this->_m9_tx_ddl_run('RENAME TABLE `' . $t . '` TO `' . $quarantine . '`, `' . $backup . '` TO `' . $t . '`', 'shadow restore ' . $t);
+                if ($this->_m9_tx_table_exists($backup) || !$this->_m9_tx_table_exists($t)) throw new M9BuilderAbort('restore_failed ' . $t);
+                $this->_m9_tx_drop($quarantine, 'discard altered ' . $t);
+                $undone++;
+            } else {
+                $this->_m9_tx_drop($shadow, 'discard shadow ' . $t);
+            }
+        } catch (Throwable $e) { $bad[] = 'table_not_restored:' . $t; }
+    }
+
+    protected function _m9_tx_drop_shadow_backups($tx) {
+        if (!is_array($tx) || empty($tx['shadow'])) return;
+        foreach ($tx['shadow'] as $t => $s) {
+            if (empty($s['done'])) continue;
+            try { $this->_m9_tx_drop($s['backup'], 'drop shadow backup ' . $t); } catch (Throwable $e) { }
+        }
+    }
+
+    public function _m9_tx_commit() {
+        if (!is_array($this->m9Tx)) throw new M9BuilderAbort('no_transaction');
+        if ($this->m9Tx['answer'] === '') throw new M9BuilderAbort('generator_answer_not_checked');
+        if (empty($this->m9Tx['files'])) throw new M9BuilderAbort('no_generated_files');
+        if (!is_array(AppModel::$m9Journal)) throw new M9BuilderAbort('journal_missing');
+        if (!empty(AppModel::$m9Journal['raw'])) throw new M9BuilderAbort('unjournaled_write ' . implode(',', array_unique(AppModel::$m9Journal['raw'])));
+        $app = rtrim(APP, DS);
+        foreach (array('Controller', 'Model', 'View') as $d) {
+            clearstatcache(true, $app . DS . $d);
+            if (is_link($app . DS . $d) || !is_dir($app . DS . $d) || !is_writable($app . DS . $d)) throw new M9BuilderAbort('folder_not_writable ' . $d);
+        }
+        // 1 every new file is written beside its target and read back
+        $i = 0;
+        foreach ($this->m9Tx['files'] as $rel => $content) {
+            $target = $app . DS . str_replace('/', DS, $rel); $dir = dirname($target);
+            clearstatcache(true, $dir); clearstatcache(true, $target);
+            if (is_link($dir) || is_link($target) || is_dir($target)) throw new M9BuilderAbort('link_or_folder_at_target ' . $rel);
+            if (!is_dir($dir)) { if (!@mkdir($dir, 0755)) throw new M9BuilderAbort('folder_not_created ' . $rel); $this->m9Tx['made'][] = $dir; }
+            $lock = $this->_m9_file_lock($target);
+            if ($lock === false) throw new M9BuilderAbort('file_busy ' . $rel);
+            $this->m9Tx['fileLocks'][$rel] = $lock;
+            $tmp = $dir . DS . '.m9b_' . $this->m9Tx['id'] . '_' . ($i++) . '.tmp';
+            $h = @fopen($tmp, 'xb');
+            if ($h === false) throw new M9BuilderAbort('file_not_written ' . $rel);
+            $this->m9Tx['stage'][$rel] = array('tmp' => $tmp, 'target' => $target, 'backup' => null, 'placed' => false);
+            $n = fwrite($h, $content); fflush($h); fclose($h);
+            clearstatcache(true, $tmp);
+            if ($n !== strlen($content) || @file_get_contents($tmp) !== $content) throw new M9BuilderAbort('file_not_written ' . $rel);
+            @chmod($tmp, 0644);
+        }
+        // 2 the files being replaced are kept
+        $bk = $app . DS . 'tmp' . DS . 'm9_builder' . DS . $this->m9Tx['id'];
+        foreach ($this->m9Tx['stage'] as $rel => $s) {
+            if (!file_exists($s['target'])) continue;
+            if (!is_dir($bk) && !@mkdir($bk, 0755, true)) throw new M9BuilderAbort('backup_folder_not_created');
+            $b = $bk . DS . str_replace('/', '__', $rel);
+            if (!@copy($s['target'], $b) || hash_file('sha256', $b) !== hash_file('sha256', $s['target'])) throw new M9BuilderAbort('backup_failed ' . $rel);
+            $this->m9Tx['stage'][$rel]['backup'] = $b;
+        }
+        // 3 the new files are moved into place (rename replaces the name, never writes through it)
+        foreach ($this->m9Tx['stage'] as $rel => $s) {
+            if (!@rename($s['tmp'], $s['target'])) throw new M9BuilderAbort('file_not_placed ' . $rel);
+            $this->m9Tx['stage'][$rel]['placed'] = true;
+        }
+        // 4 the table, last: CREATE if missing, then one ALTER, then its columns read back
+        $ddl = $this->_m9_tx_apply_ddl();
+        $this->_m9_tx_drop_shadow_backups($this->m9Tx);
+        $tx = $this->m9Tx; $this->m9Tx = null; $jr = AppModel::m9_journal_stop();
+        $this->_m9_tx_unlock_files($tx);
+        $this->_m9_tx_release_builder();
+        $this->_m9_ac_log('builder_committed', $tx['action'] . ' ' . $tx['id'] . ' files=' . count($tx['stage']) . ' table=' . $ddl . ' ' . AppModel::m9_journal_summary($jr));
+        $this->_clear_cake_cache();
+        return true;
+    }
+
+    // Undo everything the submit did. Returns true when everything was put back.
+    public function _m9_tx_rollback($why, $failure = false) {
+        $tx = $this->m9Tx;
+        if (!is_array($tx)) {
+            if (is_array(AppModel::$m9Journal)) AppModel::m9_journal_stop();
+            $this->_m9_tx_release_builder();
+            return true;
+        }
+        $this->m9Tx = null;
+        $bad = array(); $info = array(); $undone = 0; $jsum = AppModel::m9_journal_summary(AppModel::$m9Journal);
+        try {
+            // the table: an altered table is restored from its retained original before created tables are dropped
+            if (!empty($tx['shadow'])) {
+                foreach (array_reverse($tx['shadow'], true) as $t => $state) $this->_m9_tx_restore_shadow($t, $state, $bad, $undone);
+            }
+            foreach ($tx['created'] as $t) {
+                try {
+                    if (!$this->_m9_tx_table_exists($t)) continue;
+                    $n = (int)$this->_m9_tx_pdo()->query('SELECT COUNT(*) FROM `' . $t . '`')->fetchColumn();
+                    if ($n === 0) { $this->_m9_tx_ddl_run('DROP TABLE `' . $t . '`', 'undo ' . $t); $undone++; } else $bad[] = 'table_kept:' . $t;
+                } catch (Exception $e) { $bad[] = 'table_not_dropped:' . $t; }
+            }
+            // files: put back what was replaced, remove what was new, remove temporary files
+            foreach (array_reverse($tx['stage'], true) as $rel => $s) {
+                if (!$s['placed']) { @unlink($s['tmp']); continue; }
+                if ($s['backup'] !== null) {
+                    $r = dirname($s['target']) . DS . '.m9r_' . $tx['id'] . '.tmp';
+                    $ok = @copy($s['backup'], $r) && @rename($r, $s['target']) && hash_file('sha256', $s['target']) === hash_file('sha256', $s['backup']);
+                    if (!$ok) { @unlink($r); $bad[] = 'file_not_restored:' . $rel; } else $undone++;
+                } else {
+                    if (@unlink($s['target'])) $undone++; else $bad[] = 'file_not_removed:' . $rel;
+                }
+            }
+            foreach (array_reverse($tx['made']) as $d) @rmdir($d);
+            foreach (array_reverse($tx['noted']) as $p) {
+                clearstatcache(true, $p);
+                if (is_file($p) && !is_link($p)) { if (@unlink($p)) $undone++; else $bad[] = 'file_not_removed:' . basename($p); }
+                elseif (is_dir($p) && !is_link($p)) { if (@rmdir($p)) $undone++; else $bad[] = 'folder_not_removed:' . basename($p); }
+            }
+            // rows: only those this submit wrote (decision 397)
+            try { $undone += AppModel::m9_journal_undo($this->_m9_tx_pdo(), $bad, $info); } catch (Throwable $e) { AppModel::m9_journal_stop(); $bad[] = 'rows_error'; }
+        } finally {
+            $this->m9Undo = array(); $this->m9MailQueue = array(); $this->m9DeferMail = false;
+            $this->_m9_tx_unlock_files($tx);
+            $this->_m9_tx_release_builder();
+        }
+        $this->_m9_ac_log($bad ? 'builder_rollback_incomplete' : 'builder_rolled_back', $tx['action'] . ' ' . $tx['id'] . ' ' . substr(preg_replace('/[^A-Za-z0-9 _.\/:-]/', '', (string)$why), 0, 120) . ' undone=' . $undone . ' ' . $jsum . ($info ? ' ' . implode(',', $info) : '') . ($bad ? ' ' . implode(',', $bad) : ''));
+        if ($bad) {
+            $this->Session->setFlash(__('The form was not changed, but some of this submit could not be undone (%s). Reference %s in tmp/logs/m9_access.log.', implode(', ', $bad), $tx['id']), 'default', array('class' => 'alert alert-danger'));
+        } elseif ($failure || $undone > 0) {
+            $this->Session->setFlash(__('The form was not changed (%s). Everything this submit had done was undone.', substr(preg_replace('/[^A-Za-z0-9 _.\/:-]/', '', (string)$why), 0, 120)), 'default', array('class' => 'alert alert-danger'));
+        }
+        return !$bad;
+    }
+
+    // Form delete actions (delete, delete_child) drop the form's own table: the only DDL besides the builder's commit (decision 395).
+    protected function _m9_ddl_query($sql) {
+        AppModel::$m9Ddl++;
+        try { return $this->CustomTable->query($sql); } finally { AppModel::$m9Ddl--; }
+    }
+
+    // Owner's fourth review (13 Nov 2026): the form builder (add, add_child, recreate, recreate_child, create_master) changed the
+    // table and saved the form before asking the vendor's generator for the form's code; when the generator refused (an expired API
+    // subscription answers error 1) the table and the definition were already changed and the code was not. The submit is now
+    // refused before any change under the same condition on which FlinkISO's own page tells the administrator not to submit
+    // (elements/custom_forms.ctp: error 1 or no answer), asked through the same call that page makes.
+    protected function _m9_generator_ready() {
+        $r = $this->curl('post', 'custom_forms', 'elements', json_encode(array(array(), array())));
+        $j = json_decode((string)$r, true);
+        if (!is_array($j) || (isset($j['error']) && $j['error'] == 1)) {
+            $why = (is_array($j) && isset($j['message']) && is_string($j['message'])) ? substr(preg_replace('/[^A-Za-z0-9 _.-]/', '', $j['message']), 0, 60) : 'no_answer';
+            $this->_m9_ac_log('generator_unavailable', $this->request->params['controller'] . '/' . $this->request->params['action'] . ' ' . $why);
+            return false;
+        }
+        return true;
+    }
+
+    protected function _m9_generator_refuse() {
+        $this->Session->setFlash(__('The FlinkISO form generator is not available (API subscription or connection). Nothing was changed.'), 'default', array('class' => 'alert alert-danger'));
+        $this->redirect(array('action' => 'index'));
+    }
+
     public function _set_file($id = null,$type = null){        
         // before form submit
         // create call back folder
@@ -897,9 +1303,9 @@ class CustomTablesController extends AppController {
 
         if (file_exists($qcpfile)) {
             $folder = WWW_ROOT .  'files' . DS . $this->Session->read('User.company_id') . DS . 'custom_tables' . DS . $id;
-            $tmpfolder = new Folder();
-            if ($tmpfolder->create($folder)) {
-                if (copy($qcpfile, $tofile)) {
+            // owner's fifth review (decision 393): the working copy goes through _m9_safe_copy (no link followed, replaced by rename)
+            if (true) {
+                if (($m9c = $this->_m9_safe_copy(WWW_ROOT . 'files' . DS . $this->Session->read('User.company_id'), 'custom_tables/' . $id, $file_name, $qcpfile, true)) && $m9c[0]) {
                 } else {
                     $this->Session->setFlash(__('File copy failed'));
                     $this->redirect(array('action' => 'index', 'qc_document_id' => $this->request->params['named']['qc_document_id'],'process_id' => $this->request->params['named']['process_id']));
@@ -940,6 +1346,8 @@ class CustomTablesController extends AppController {
         $this->_commons($this->Session->read('User.id'));
         // afert form submit
         if ($this->request->is('post')) {            
+            if (false === $this->_m9_generator_ready()) $this->_m9_generator_refuse(); // owner's fourth review: no change unless the generator answers
+            $this->_m9_tx_begin(); // owner's fifth review (decision 392): from here this submit changes everything or nothing
 
             $this->request->data['CustomTable']['password'] = Security::hash($this->request->data['CustomTable']['password'], 'md5', true);
 
@@ -1012,6 +1420,7 @@ class CustomTablesController extends AppController {
                 $data = array($this->request->data,$table_name,$friendlyName,$defaultfield,$customTable);
                 $result = $this->curl('post','custom_forms','create_child',$data);
                 $result = json_decode($result,true);
+                $this->_m9_tx_check_answer($result, 'create_child'); // decision 392: the whole answer is checked before it is used
                 
 
                 if($result['error'] == 1){
@@ -1039,7 +1448,6 @@ class CustomTablesController extends AppController {
                     if($result['index']){
                         $folder = APP . 'View' . DS . Inflector::pluralize(Inflector::classify($table_name));        
                         $modelFolder = new Folder();
-                        $modelFolder->create($folder);
                         $file = $folder . DS . 'index.ctp';
                         $this->_write_to_file($folder,$file,$result['index']);
                     }
@@ -1048,7 +1456,6 @@ class CustomTablesController extends AppController {
                     
                     $folder = APP . 'View' . DS . Inflector::pluralize(Inflector::classify($table_name));        
                     $modelFolder = new Folder();
-                    $modelFolder->create($folder);
                     
                     foreach($addCode as $file => $code){
                         $file = $folder . DS . $file.'.ctp';
@@ -1079,8 +1486,10 @@ class CustomTablesController extends AppController {
                 $sqld.= "`custom_table_id` varchar(36) NOT NULL DEFAULT '" . $this->CustomTable->id . "',";
 
                 $sqlresult = $this->_add_new_table($table_name,$defaultfield,$sqld,$this->request->data['CustomTableFields']);
-
-                if ($this->_show_approvals()) $this->_save_approvals($this->CustomTable->id);
+                $this->_m9_approval_begin();
+                if ($this->_show_approvals() && !$this->_save_approvals($this->CustomTable->id)) throw new M9BuilderAbort('approval_save_failed');
+                $this->_m9_tx_commit(); // decision 392
+                $this->_m9_approval_commit(); // mail leaves only after the form commit succeeded
                 $this->Session->setFlash(__('Form created'));
                 $this->redirect(array('action' => 'index', 'qc_document_id' => $this->request->params['named']['qc_document_id']));
             } else {
@@ -1201,7 +1610,7 @@ class CustomTablesController extends AppController {
                             }
                             $sql = 'DROP TABLE `' . $childs['table_name'] . '`';
                             try {
-                                $q = $this->CustomTable->query($sql);
+                                $q = $this->_m9_ddl_query($sql);
                             }
                             catch(Exception $e) {
                             }
@@ -1241,7 +1650,7 @@ class CustomTablesController extends AppController {
                             $sql = 'DROP TABLE `' . $customTable['CustomTable']['table_name'] . '`';
 
                             try {
-                                $q = $this->CustomTable->query($sql);
+                                $q = $this->_m9_ddl_query($sql);
                             }
                             catch(Exception $e) {
                                 
@@ -1286,7 +1695,7 @@ class CustomTablesController extends AppController {
                                 
                                 $sql = 'DROP TABLE `' . $child_table['CustomTable']['table_name'] . '`';
                                 try {                                
-                                    $q = $this->CustomTable->query($sql);
+                                    $q = $this->_m9_ddl_query($sql);
                                 }
                                 catch(Exception $e) {                                        
                                 }
@@ -1348,6 +1757,8 @@ class CustomTablesController extends AppController {
         }
 
         if ($this->request->is('post') || $this->request->is('put') || $skip == true) {
+            if (false === $this->_m9_generator_ready()) $this->_m9_generator_refuse(); // owner's fourth review: no change unless the generator answers
+            $this->_m9_tx_begin(); // owner's fifth review (decision 392): from here this submit changes everything or nothing
 
             $updatesql = '';
             $dropsql = '';
@@ -1422,22 +1833,8 @@ class CustomTablesController extends AppController {
                 $friendlyName = $this->request->data['CustomTable']['name'];
                 $hasMany = $this->request->data['CustomTable']['has_many'];
 
-                //add permissions
-                chmod(APP . 'Controller', 0777);
-                chmod(APP . 'Model', 0777);
-                chmod(APP . 'View', 0777);
-                
-                $dir_writable_controller = substr(sprintf('%o', fileperms(APP . 'Controller')), -3) == "777"  ? true : false;
-                $dir_writable_model = substr(sprintf('%o', fileperms(APP . 'Model')), -3) == "777"  ? true : false;
-                $dir_writable_view = substr(sprintf('%o', fileperms(APP . 'View')), -3) == "777"  ? true : false;
-                
-                if($dir_writable_controller == false || $dir_writable_model == false || $dir_writable_view == false){
-                    $this->Session->setFlash(__('Unable to change directory permissions. Please manually change app/Controller, app/Model & app/View directories to writable.(0777)'));
-                    if($skip == false) $this->redirect(array('action' => 'recreate',$this->request->data['CustomTable']['id']));
-                    else echo "Unable to change directory permissions. Please manually change app/Controller, app/Model & app/View directories to writable.(0777)";exit;
-                }else{
-
-                }
+                // Owner's fifth review (16 Nov 2026), decision 396: no chmod 0777; the folders must already be writable by the site's PHP user.
+                foreach (array('Controller', 'Model', 'View') as $m9d) if (!is_writable(APP . $m9d)) throw new M9BuilderAbort('folder_not_writable ' . $m9d);
 
                 // run update quieries
                 $sqlresult = $this->_add_new_table($table_name,$defaultfield,null,$this->request->data['CustomTableFields']);
@@ -1468,6 +1865,7 @@ class CustomTablesController extends AppController {
                 $data = array($this->request->data,$table_name,$friendlyName,$defaultfield,json_encode($hasMany));
                 $result = $this->curl('post','custom_forms','create',$data);
                 $result = json_decode($result,true);
+                $this->_m9_tx_check_answer($result, 'create'); // decision 392: the whole answer is checked before it is used
                 
                 if(!$result || $result['error'] == 1){
                     $this->Session->setFlash(__('Something went wrong. Please try again'));
@@ -1491,11 +1889,9 @@ class CustomTablesController extends AppController {
 
                     $viewCode = json_decode($result['viewFile'],true);
 
-                    chmod(APP . 'View', 0777);
                     $folder = APP . 'View' . DS . Inflector::pluralize(Inflector::classify($table_name));        
                     $modelFolder = new Folder();
-                    $modelFolder->create($folder);
-                    chmod($folder, 0777);
+                    $this->_m9_mode($folder);
                     
                     if($viewCode['index']){
                         $file = $folder . DS . 'index.ctp';
@@ -1535,9 +1931,13 @@ class CustomTablesController extends AppController {
                     }                    
                 }
 
+                $doApprovals = ($skip == false && $this->_show_approvals());
+                $this->_m9_approval_begin();
+                if ($doApprovals && !$this->_save_approvals($this->CustomTable->id)) throw new M9BuilderAbort('approval_save_failed');
+                $this->_m9_tx_commit(); // decision 392
+                $this->_m9_approval_commit(); // mail leaves only after the form commit succeeded
                 $this->_clear_cake_cache();
                 if($skip == false) {
-                    if ($this->_show_approvals()) $this->_save_approvals($this->CustomTable->id);            
                     $this->redirect(array('action' => 'recreate',$this->request->data['CustomTable']['id']));    
                 }
                 
@@ -1639,6 +2039,8 @@ class CustomTablesController extends AppController {
         }
 
         if ($this->request->is('post') || $this->request->is('put')) {
+            if (false === $this->_m9_generator_ready()) $this->_m9_generator_refuse(); // owner's fourth review: no change unless the generator answers
+            $this->_m9_tx_begin(); // owner's fifth review (decision 392): from here this submit changes everything or nothing
             
             foreach ($this->request->data['CustomTableFields'] as $chkd) {
                 if ($chkd['field_name']) $chkarray[] = $chkd['field_name'];
@@ -1722,25 +2124,10 @@ class CustomTablesController extends AppController {
                 
                 $result = $this->curl('post','custom_forms','create_child',$data);
                 $result = json_decode($result,true);
+                $this->_m9_tx_check_answer($result, 'create_child'); // decision 392: the whole answer is checked before it is used
 
-                //add permissions
-                chmod(APP . 'Controller', 0777);
-                chmod(APP . 'Model', 0777);
-                chmod(APP . 'View', 0777);
-                mkdir(APP . 'View' . DS . Inflector::pluralize(Inflector::classify($table_name)));
-                chmod(APP . 'View' . DS . Inflector::pluralize(Inflector::classify($table_name)),0777);
-                
-                
-                $dir_writable_controller = substr(sprintf('%o', fileperms(APP . 'Controller')), -3) == "777"  ? true : false;
-                $dir_writable_model = substr(sprintf('%o', fileperms(APP . 'Model')), -3) == "777"  ? true : false;
-                $dir_writable_view = substr(sprintf('%o', fileperms(APP . 'View' . DS . Inflector::pluralize(Inflector::classify($table_name)))), -3) == "777"  ? true : false;
-
-                if($dir_writable_controller == false || $dir_writable_model == false || $dir_writable_view == false){
-                    $this->Session->setFlash(__('Unable to change directory permissions. Please manually change app/Controller, app/Model & app/View directories to writable.(0777)'));
-                    $this->redirect(array('action' => 'recreate_child',$this->request->data['CustomTable']['id']));
-                }else{
-
-                }
+                // Owner's fifth review (16 Nov 2026), decision 396: no chmod 0777; the folders must already be writable by the site's PHP user.
+                foreach (array('Controller', 'Model', 'View') as $m9d) if (!is_writable(APP . $m9d)) throw new M9BuilderAbort('folder_not_writable ' . $m9d);
 
                 if($result['error'] == 1){
                     echo "Something went wrong. Please try again";
@@ -1764,7 +2151,6 @@ class CustomTablesController extends AppController {
                     $viewCode = json_decode($result['viewFile'],true);
                     $folder = APP . 'View' . DS . Inflector::pluralize(Inflector::classify($table_name));        
                     $modelFolder = new Folder();
-                    $modelFolder->create($folder);
 
                     if($result['index']){
                         $file = $folder . DS . 'index.ctp';
@@ -1806,8 +2192,10 @@ class CustomTablesController extends AppController {
                 $this->CustomTable->save($customTable);
 
                 $sqlresult = $this->_add_new_table($customTable['CustomTable']['table_name'],$defaultfield,$sqld,$this->request->data['CustomTableFields']);
-                
-                if ($this->_show_approvals()) $this->_save_approvals($this->CustomTable->id);
+                $this->_m9_approval_begin();
+                if ($this->_show_approvals() && !$this->_save_approvals($this->CustomTable->id)) throw new M9BuilderAbort('approval_save_failed');
+                $this->_m9_tx_commit(); // decision 392
+                $this->_m9_approval_commit(); // mail leaves only after the form commit succeeded
                 $this->redirect(array('action' => 'recreate_child',$this->request->params['pass'][0]));
             } else {
                 $this->Session->setFlash(__('The custom table could not be saved. Please, try again.'));
@@ -1878,17 +2266,17 @@ class CustomTablesController extends AppController {
                 $file_name = $file_name . '.' . $file_type;
 
                 $file_for_save = $path_for_save . DS . $file_name;
-                $testfolder = new Folder($path_for_save,true, 0777);
+                $testfolder = new Folder($path_for_save,true, 0755);
                 $testfolder->create($path_for_save);                
                 
                 try{
-                    chmod($path_for_save, 0777);    
+                    $this->_m9_mode($path_for_save);    
                 }catch (Exception $e){
                     
                 }
 
                 try{
-                    chmod($file_for_save, 0777);
+                    $this->_m9_mode($file_for_save);
                 }catch (Exception $e){
                     
                 }
@@ -2003,8 +2391,8 @@ class CustomTablesController extends AppController {
                 $file_for_save = $path_for_save . DS . $fileName;
                 $testfolder = new Folder($path_for_save);
                 $testfolder->create($path_for_save);
-                chmod($path_for_save, 0777);
-                chmod($file_for_save, 0777);
+                $this->_m9_mode($path_for_save);
+                $this->_m9_mode($file_for_save);
                 $downloadUri = $data["url"];
 
                 if (file_get_contents($downloadUri) === FALSE) {
@@ -2222,7 +2610,7 @@ class CustomTablesController extends AppController {
                         $this->File->delete(array('File.controller' => $customTable['CustomTable']['table_name']));
                         $sql = 'DROP TABLE IF EXISTS  `' . $customTable['CustomTable']['table_name'] . '`';
                         
-                        $q = $this->CustomTable->query($sql);
+                        $q = $this->_m9_ddl_query($sql);
                         $this->CustomTable->delete($customTable['CustomTable']['id']);
                         $this->Session->setFlash(__('Table Deleted'));
                         $this->redirect(array('action' => 'index'));
@@ -2318,7 +2706,7 @@ class CustomTablesController extends AppController {
 
             $customTable['CustomTableFields'] = $newFields;
 
-            $this->CustomTable->query($sql);
+            $this->_m9_ddl_query($sql);
             $this->Session->setFlash(__('Changes Saved.'));
             $this->redirect(array('action' => 'recreate', $customTable['CustomTable']['id']));
         } else {
@@ -2415,7 +2803,7 @@ class CustomTablesController extends AppController {
             
             $this->CreateChildForm->_create_form($customTable, $customTable['CustomTable']['table_name'], $customTable['CustomTable']['name'], $defaultfield, null, null);
             $this->CreateChildView->_create_view($this->request->data, $this->request->data['CustomTable']['table_name'], $this->request->data['CustomTable']['name'], $defaultfield, null, null);
-            $this->CustomTable->query($sql);
+            $this->_m9_ddl_query($sql);
             $this->Session->setFlash(__('Changes Saved.'));
             $this->redirect(array('action' => 'recreate_child', $customTable['CustomTable']['id']));
         } else {
@@ -2643,6 +3031,8 @@ class CustomTablesController extends AppController {
 
     public function create_master(){
         if ($this->request->is('post') || $this->request->is('put')) {            
+            if (false === $this->_m9_generator_ready()) $this->_m9_generator_refuse(); // owner's fourth review: no change unless the generator answers
+            $this->_m9_tx_begin(); // owner's fifth review (decision 392): from here this submit changes everything or nothing
             $this->autoRender = false;
             $this->request->data['CustomTable']['password'] = Security::hash($this->request->data['CustomTable']['password'], 'md5', true);
             $tableName = $this->_make_table_name(null,'masters');
@@ -2674,6 +3064,7 @@ class CustomTablesController extends AppController {
                 $data = array($this->request->data,$table_name,$friendlyName,$defaultfield);
                 $result = $this->curl('post','custom_forms','create_masters',$data);            
                 $result = json_decode($result,true);
+                $this->_m9_tx_check_answer($result, 'create_masters'); // decision 392: the whole answer is checked before it is used
 
                 if($result['error'] == 1 || $result == null){
                     echo "Something went wrong. Please try again";
@@ -2685,11 +3076,9 @@ class CustomTablesController extends AppController {
                     $viewCode = json_decode($result['controller_model'],true);
 
 
-                    chmod(APP . 'View', 0777);
                     $folder = APP . 'View' . DS . Inflector::pluralize(Inflector::classify($table_name));        
                     $viewFolder = new Folder();
-                    $viewFolder->create($folder);
-                    chmod($folder, 0777);
+                    $this->_m9_mode($folder);
                     
                     if($viewCode['controller']){
 
@@ -2766,7 +3155,9 @@ class CustomTablesController extends AppController {
                 $this->_clear_cake_cache();
                 Configure::write('debug',2);
 
-                if($this->CustomTable->query($sql)){
+                $this->_m9_tx_queue_create($customTable['CustomTable']['table_name'], $sql);
+                $this->_m9_tx_commit(); // decision 392: files, then the table; on failure all is undone
+                if (true) {
                     $controllers = array();
                     $aCtrlClasses = App::objects('controller');
                     $skip = array('AppController', 'ApprovalsController', 'ApprovalCommentsController', 'CustomTablesController', 'FilesController', 'RecordsController', 'UserSessionsController');

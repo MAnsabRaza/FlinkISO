@@ -1,4 +1,18 @@
 <?php echo $this->Session->flash();?>   
+<?php
+// M9 review R1 (owner review 12 Nov 2026): the cover template is no longer created by opening this page. When it does not exist
+// yet, the page shows this notice only; the button posts (the layout adds the session token) and the controller creates it once.
+if (!empty($m9CoverMissing)) { ?>
+<div class="alert alert-warning">
+    <p><strong>The QC document cover template has not been created yet.</strong></p>
+    <?php
+    echo $this->Form->create('PdfTemplate', array('url' => array('controller' => 'pdf_templates', 'action' => 'add_cover', 'CoverTemplate'), 'type' => 'post'));
+    echo $this->Form->hidden('m9_create_cover', array('value' => 1));
+    echo $this->Form->submit('Create cover template', array('class' => 'btn btn-sm btn-info'));
+    echo $this->Form->end();
+    ?>
+</div>
+<?php return; } ?>
 <?php   
 echo $this->Html->css(array(
     'prism',

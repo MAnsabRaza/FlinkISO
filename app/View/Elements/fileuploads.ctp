@@ -143,6 +143,7 @@ if(!$id){
 		var r = confirm("Delete file? This action can not be reversed.");
 		if (r == true) {
 			$.ajax({
+				type: 'POST', // M9 review O2: deletes are POST only and carry the session token (layout)
 				url: "<?php echo Router::url('/', true); ?><?php echo $this->request->params['controller'] ?>/delete_uploaded_file/" + file,
 				success: function(data, result) {
 					$("#id_"+id).hide();        
@@ -169,6 +170,7 @@ if(!$id){
 		var r = confirm("Delete folder? This action can not be reversed.");
 		if (r == true) {
 			$.ajax({
+				type: 'POST', // M9 review O2
 				url: "<?php echo Router::url('/', true); ?><?php echo $this->request->params['controller'] ?>/delete_uploaded_folder/" + folderpath,
 				success: function(data, result) {
 					$("#fid_"+id).hide();        

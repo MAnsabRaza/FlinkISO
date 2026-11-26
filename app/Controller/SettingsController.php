@@ -60,7 +60,7 @@ class SettingsController extends AppController {
                 }
 
                 if(!file_exists(WWW_ROOT . DS . 'img' . DS . 'logo')){
-                    new Folder(WWW_ROOT . DS . 'img' . DS . 'logo', TRUE, 0777);
+                    new Folder(WWW_ROOT . DS . 'img' . DS . 'logo', TRUE, 0755);
                 }
 
              $moveLogo = move_uploaded_file($this->request->data['Setting']['company_logo']['tmp_name'], WWW_ROOT . DS . 'img' . DS . 'logo' . DS . $fileinfo['basename']); //die;

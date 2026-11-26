@@ -4,6 +4,16 @@
 if( isset($doc_not_found) && $doc_not_found == true){
 	echo "<div class='alert alert-danger'><i class='fa fa-warning'></i> Document not found for this table</div>";
 }
+// Owner's fourth review (13 Nov 2026): the form's copy of its document is no longer made by opening this page. The button posts
+// (the layout adds the session token) and restore_form_document copies it once.
+if (!empty($m9FormCopyMissing)) {
+	echo "<div class='alert alert-warning'><p><i class='fa fa-warning'></i> This form's copy of its document is missing.</p>";
+	echo $this->Form->create('CustomTable', array('url' => array('controller' => 'custom_tables', 'action' => 'restore_form_document', $customTable['CustomTable']['id']), 'type' => 'post'));
+	echo $this->Form->hidden('m9_restore', array('value' => 1));
+	echo $this->Form->submit('Restore the form document', array('class' => 'btn btn-sm btn-warning'));
+	echo $this->Form->end();
+	echo "</div>";
+}
 echo $this->Html->css(array('code-input-main/code-input.min','prism'));
 echo $this->fetch('css');
 echo $this->Html->script(array(

@@ -42,6 +42,44 @@
 	)); 
 }
 echo $this->fetch('script');
+// M9 review O2 and decision 342 (owner review 10 Nov 2026): the session token that the server requires on deletes and uploads.
+// Every AJAX call from these pages sends it as a header; every form on the page (also forms loaded later) carries it as the field
+// m9tk; a click on a link to an action that deletes on a plain GET is sent as a POST with the token instead.
+if ($this->Session->read('User.id') && preg_match('/^[0-9a-f]{64}$/', (string)$this->Session->read('M9.tk')) === 1) {
+?>
+<meta name="m9tk" content="<?php echo h((string)$this->Session->read('M9.tk')); ?>">
+<script>
+(function ($) {
+	var tk = $('meta[name="m9tk"]').attr('content') || '';
+	if (!tk) return;
+	// M9 review s76 (11 Nov 2026): the header goes to this site only (revision 4 set it for every host, so a call to another
+	// site would have carried the token and needed a cross-site preflight). Set per request in the filter below.
+	var own = function (f) { var a = document.createElement('a'); a.href = f.getAttribute('action') || location.href; return a.host === location.host; };
+	var add = function (root) { $(root).find('form').addBack('form').each(function () { if (own(this) && !$(this).find('input[name="m9tk"]').length) $('<input type="hidden" name="m9tk">').val(tk).appendTo(this); }); };
+	$(function () { add(document); });
+	$(document).ajaxComplete(function () { add(document); });
+	$(document).on('submit', 'form', function () { add(this); });
+	// M9 review P2 (owner review 11 Nov 2026): the server accepts these actions only as POST with the token, so a link to one,
+	// and a GET call to one from a page script (jQuery load, get or ajax), is sent as a POST instead. FlinkISO's own delete pages
+	// (a plain <screen>/delete link) are not listed: a GET there shows the confirmation page, whose form posts.
+	var getDel = /\/(([a-z0-9_]+\/)?(delete_[a-z0-9_]+|deletesignature|bulk_delete|purge|check_document|upload_document)|chd_[a-z0-9_]+\/delete|approval_steps\/delete|graph_panels\/(delete|reset_display)|pie_chart_panels\/reset_display|pdf_templates\/delete|approvals\/action|custom_tables\/(process_sequence|reset_table_password)|designations\/update_parent|employees\/update_parent|users\/copy_access_from)(\/|\?|$)/i;
+	$.ajaxPrefilter(function (o, oo, x) {
+		var u = document.createElement('a'); u.href = o.url || location.href;
+		if (u.host !== location.host) return;
+		x.setRequestHeader('X-M9-Token', tk);
+		if (getDel.test(u.pathname) && String(o.type || 'GET').toUpperCase() === 'GET') o.type = 'POST';
+	});
+	$(document).on('click', 'a[href]', function (e) {
+		if (e.isDefaultPrevented() || this.host !== location.host || !getDel.test(this.pathname)) return;
+		e.preventDefault();
+		var f = $('<form method="post" style="display:none"></form>').attr('action', this.href);
+		$('<input type="hidden" name="m9tk">').val(tk).appendTo(f);
+		f.appendTo(document.body).submit();
+	});
+})(jQuery);
+</script>
+<?php
+}
 ?>
 </head>
 <body class="hold-transition skin-blue sidebar-collapse sidebar-mini">

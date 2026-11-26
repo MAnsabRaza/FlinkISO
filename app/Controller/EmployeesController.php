@@ -188,7 +188,7 @@ class EmployeesController extends AppController {
             $user['User']['employee_id'] = $employee_id;
             $user['User']['name'] = $data['Employee']['name'];
             $user['User']['username'] = $data['Employee']['office_email'];
-            $user['User']['password'] = Security::hash($data['Employee']['office_email'], 'md5', true);
+            $user['User']['password'] = $this->_m9_password_hash($data['Employee']['office_email']);
             $user['User']['branch_id'] = $data['Employee']['branch_id'];
             $user['User']['department_id'] = $data['Employee']['department_id'];
             $user['User']['assigned_branches'] = json_encode(array($data['Employee']['branch_id']));

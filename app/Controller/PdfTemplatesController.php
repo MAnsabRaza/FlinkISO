@@ -68,7 +68,7 @@ public function add($custom_table_id = null,$qc_document_id = null){
         if(file_exists($path . DS . 'template.docx') && $this->request['data']['PdfTemplate']['custom_table_id']){
 
             $pdf_template_folder = new Folder();
-            $pdf_template_folder->create($path,0777);
+            $pdf_template_folder->create($path,0755);
             $url = Router::url('/', true) . 'files/'.$this->Session->read('User.company_id').'/pdf_template/' . $this->request['data']['PdfTemplate']['custom_table_id'] .'/template.docx' ;
             
             $html = $this->_convert_to_html($url,'docx','html',null,'Template',$this->request['data']['PdfTemplate']['custom_table_id'],$this->Session->read('User.company_id'));
@@ -85,7 +85,7 @@ public function add($custom_table_id = null,$qc_document_id = null){
                 $from = new Folder($path);
                 $new = Configure::read('files') . DS . 'pdf_template' . DS . $this->PdfTemplate->id;
                 $new_folder = new Folder();
-                $new_folder->create($new,0777);
+                $new_folder->create($new,0755);
                 $from->copy($new);
                 $templateFile = Configure::read('files') . DS .'pdf_template' . DS . $this->PdfTemplate->id . DS . 'template.html';
                 $filetoread = new File($templateFile);
@@ -192,7 +192,7 @@ public function add($custom_table_id = null,$qc_document_id = null){
                 $path = Configure::read('files') . DS . 'pdf_template' . DS .$customTable['CustomTable']['id'] ;
                 if(!file_exists($path . DS . 'template.docx')){
                     $pdf_template_folder = new Folder();
-                    $pdf_template_folder->create($path,0777);
+                    $pdf_template_folder->create($path,0755);
                 }
                 if(!$fontsize)$fontsize = '12';
                 if(!$fontface)$fontface = 'arial';
@@ -244,7 +244,7 @@ public function add($custom_table_id = null,$qc_document_id = null){
                     $path = Configure::read('files') . DS . 'pdf_template' . DS .$customTable['CustomTable']['id'] ;
                     if(!file_exists($path . DS . 'template.docx')){
                         $pdf_template_folder = new Folder();
-                        $pdf_template_folder->create($path,0777);
+                        $pdf_template_folder->create($path,0755);
                     }
                     if(!$fontsize)$fontsize = '12';
                     if(!$fontface)$fontface = 'arial';
@@ -461,6 +461,10 @@ public function _convert_to_html($url = null,$filetype = null,$outputtype = null
     $response_data = file_get_contents($path, FALSE, $context);
     $downloadUri = json_decode($response_data,true);
     $downloadUri = $downloadUri['fileUrl'];
+    // M9 run s78 (13 Nov 2026): when the document server returns no file address (conversion failed, or the server could not fetch
+    // the file), PHP 8 stops the whole request at file_get_contents(null) ("Path cannot be empty"), so nothing after it ran and the
+    // cover template row was never saved. Now the conversion is skipped and logged, and the request goes on.
+    if (false === is_string($downloadUri) || $downloadUri === '') { $this->log('pdf_templates conversion: no file address from the document server for ' . (string)$record_id); return null; }
     
     $new_data = file_get_contents($downloadUri);
     if ($new_data === FALSE) {
@@ -475,7 +479,7 @@ public function _convert_to_html($url = null,$filetype = null,$outputtype = null
         if(file_exists($savepath)){
         }else{
             $folder = new Folder();
-            if ($folder->create($savepath,0777)) {
+            if ($folder->create($savepath,0755)) {
             } else {
                 echo "Folder creation failed";
                 exit;
@@ -496,7 +500,7 @@ public function edit($id = null){
         $path = Configure::read('files') . DS . 'pdf_template' . DS . $this->request['data']['PdfTemplate']['id'] ;
         if(file_exists($path . DS . 'template.docx')){
             $pdf_template_folder = new Folder();
-            $pdf_template_folder->create($path,0777);
+            $pdf_template_folder->create($path,0755);
             $url = Router::url('/', true) . 'files/'.$this->Session->read('User.company_id').'/pdf_template/' . $this->request['data']['PdfTemplate']['id'] .'/template.docx' ;
             $html = $this->_convert_to_html($url,'docx','html',null,'Template',$this->request['data']['PdfTemplate']['id'],$this->Session->read('User.company_id'));
             $html = str_replace('&quot;','"',$html);
@@ -631,16 +635,16 @@ public function save_template() {
         $record_id = $this->request->params['named']['record_id'];
         $path_for_save = WWW_ROOT . 'files' . DS . $local['company_id'] . DS . 'pdf_template' . DS . $local['record_id'];
         $file_for_save = $path_for_save . DS . 'template.docx';
-        $testfolder = new Folder($path_for_save,true, 0777);
+        $testfolder = new Folder($path_for_save,true, 0755);
         $testfolder->create($path_for_save);
         try{
-            chmod($path_for_save, 0777);
+            $this->_m9_mode($path_for_save);
         }catch (Exception $e){
 
         }
 
         try{
-            chmod($file_for_save, 0777);
+            $this->_m9_mode($file_for_save);
         }catch (Exception $e){
 
         }
@@ -740,14 +744,14 @@ public function _generate_header(){
     $table .= "</table></body></html>"; 
     $path = Configure::read('files') . DS . 'pdf_template' . DS . 'header';
     $headerFolder = new Folder();
-    $headerFolder->create($path,0777);
+    $headerFolder->create($path,0755);
     $this->_write_html_file('template',$table,'header');
 }
 
 public function _write_html_file($filename = null, $content = null, $record_id = null){
     $path = Configure::read('files') . DS . 'pdf_template' . DS . $record_id;
     $folder = new Folder();
-    if ($folder->create($path,0777)) {
+    if ($folder->create($path,0755)) {
     } else {
         echo "Folder creation failed.";
         exit;
@@ -775,6 +779,17 @@ public function add_cover(){
         $cover = $this->PdfTemplate->find('first',array('conditions'=>array('PdfTemplate.template_type'=>3,'PdfTemplate.custom_table_id'=>'PdfTemplate')));
         $this->set('cover',$cover);
     }else{
+        // M9 review R1 (owner review 12 Nov 2026). FlinkISO created the cover template here on a GET, and created one more row on every
+        // visit for as long as cover/template.docx did not exist. Now a GET only shows that the template is missing, with a button;
+        // the template is created by that button's POST (with the session token), and an existing cover row is reused, never doubled.
+        $cover = $this->PdfTemplate->find('first',array('recursive'=>-1,'conditions'=>array('PdfTemplate.template_type'=>3,'PdfTemplate.custom_table_id'=>'PdfTemplate')));
+        if (false === $this->request->is('post') || empty($this->request->data['PdfTemplate']['m9_create_cover'])) {
+            $this->set('m9CoverMissing', true);
+            $this->set('cover', $cover);
+            return;
+        }
+        $data = array();
+        if (!empty($cover['PdfTemplate']['id'])) $data['PdfTemplate']['id'] = $cover['PdfTemplate']['id'];
         $table =$this->_generate_cover();
         $data['PdfTemplate']['name'] = 'cover';
         $data['PdfTemplate']['custom_table_id'] = 'PdfTemplate';
@@ -796,8 +811,7 @@ public function add_cover(){
         $data['PdfTemplate']['template'] = $table;
         $this->PdfTemplate->create();
         $this->PdfTemplate->save($data,false);
-        $cover = $this->PdfTemplate->find('first',array('conditions'=>array('PdfTemplate.template_type'=>3,'PdfTemplate.custom_table_id'=>'PdfTemplate')));
-        $this->set('cover',$cover);
+        $this->redirect(array('action' => 'add_cover', 'CoverTemplate')); // shows the template, or the notice again if the document server could not make the file
     }
 }
 
@@ -847,7 +861,7 @@ public function _generate_cover(){
 
         $path = Configure::read('files') . DS . 'pdf_template' . DS . 'cover';
         $headerFolder = new Folder();
-        $headerFolder->create($path,0777);
+        $headerFolder->create($path,0755);
         $this->_write_html_file('template',$table,'cover');
         return $table;
     }

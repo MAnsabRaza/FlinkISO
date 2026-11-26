@@ -72,7 +72,7 @@ class TemplatesController extends AppController {
                 if (!file_exists(Configure::read('path') . DS . $id)) {
                     $pathfolder = new Folder();
                     if ($pathfolder->create(Configure::read('path') . DS . $id)) {
-                        chmod(Configure::read('path') . DS . $id,0777);
+                        $this->_m9_mode(Configure::read('path') . DS . $id);
                     } else {
                         echo "failed folder" . Configure::read('path');
                         exit;
@@ -151,9 +151,9 @@ class TemplatesController extends AppController {
         $name = $this->_clean_table_names($name);
         $to = WWW_ROOT . DS . 'files' . DS . $this->Session->read('User.company_id') . DS . 'templates' . DS . $id;
         if(!file_exists($to)){
-            $testfolder = new Folder($to, TRUE, 0777);
+            $testfolder = new Folder($to, TRUE, 0755);
             $testfolder->create($to);
-            chmod($to, 0777);
+            $this->_m9_mode($to);
         }
         
         $from = WWW_ROOT . 'files' . DS . 'samples' .DS . 'sample.'.$type;
@@ -198,8 +198,8 @@ class TemplatesController extends AppController {
                 $file_for_save = $path_for_save . DS . $file;
                 $testfolder = new Folder($path_for_save);
                 $testfolder->create($path_for_save);
-                chmod($path_for_save, 0777);
-                chmod($file_for_save, 0777);
+                $this->_m9_mode($path_for_save);
+                $this->_m9_mode($file_for_save);
                 $downloadUri = $data["url"];
                 if (($new_data = file_get_contents($downloadUri)) === FALSE) {
                 } else {
@@ -216,7 +216,7 @@ class TemplatesController extends AppController {
                         $history_file_for_save = $path_for_save . DS .$file.'-hist' . DS . $version;
                         $historyFolder = new Folder($history_file_for_save);
                         $historyFolder->create($history_file_for_save);
-                        chmod($history_file_for_save, 0777);
+                        $this->_m9_mode($history_file_for_save);
                         file_put_contents($history_file_for_save . DS . "createdInfo.json", json_encode($json, JSON_PRETTY_PRINT));
 
 

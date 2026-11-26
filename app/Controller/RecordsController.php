@@ -146,7 +146,7 @@ class RecordsController extends AppController {
                 if (!file_exists(Configure::read('path') . DS . $this->request->data['Record']['id'])) {
                     $pathfolder = new Folder();
                     if ($pathfolder->create(Configure::read('path') . DS . $this->request->data['Record']['id'])) {
-                        chmod(Configure::read('path') . DS . $this->request->data['Record']['id'],0777);
+                        $this->_m9_mode(Configure::read('path') . DS . $this->request->data['Record']['id']);
                         copy($from, $file);
                         $key = $this->_generate_onlyoffice_key($this->request->data['Record']['id'] . date('Ymdhis'));
                         $this->set('file_key', $key);

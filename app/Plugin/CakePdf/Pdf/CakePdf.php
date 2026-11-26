@@ -280,7 +280,7 @@ class CakePdf {
 	}
 
 	public function _write_to_file_html($folder = null, $file = null, $content = null){
-        chmod($folder,0777);
+        // Owner's fifth review (16 Nov 2026), decision 396: the PDF folder is no longer set to 0777; its mode is left as it is.
         $fp = fopen($file, 'w');
         return fwrite($fp, $content) && fclose($fp);
     }

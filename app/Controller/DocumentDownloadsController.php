@@ -311,6 +311,8 @@ public function _add_cover($data = null,$id = null){
 	return true;
 }
 public function download(){
+	// M9 review V4 (10 Nov 2026): the address id names a record; anything else is refused before any folder is touched
+	if (isset($this->request->params['named']['id']) && (string)$this->request->params['named']['id'] !== '' && false === $this->_isValidUuid($this->request->params['named']['id'])) $this->_m9_ac_refuse('bad_record_id', 'download');
 	if ($this->request->is('post')) {	
 		$this->set('addwatermark',false);
 		if($this->request->params['named']['type'] == 'rec'){			
@@ -573,7 +575,7 @@ public function _write_html_file($filename = null, $content = null, $record_id =
 	$path = WWW_ROOT .'files' . DS . 'pdf' . DS . $this->Session->read('User.id') . DS . $record_id;	
 
 	$folder = new Folder();
-	if ($folder->create($path,0777)) {
+	if ($folder->create($path,0755)) {
 	} else {
 		echo "Folder creation failed";
 		exit;
@@ -1024,8 +1026,8 @@ public function _generate_pdf_file($header_file = null,$content = null,$fileName
 		if(!file_exists($path)){
 			mkdir($path);
 		}
-		chmod($dir,0777);
-		chmod($path,0777);
+		$this->_m9_mode($dir);
+		$this->_m9_mode($path);
 	}catch(Exception $e){            
 	}
 

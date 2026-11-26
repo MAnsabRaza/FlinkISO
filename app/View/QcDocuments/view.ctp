@@ -274,7 +274,7 @@
 										'docid'=> $qcDocument['QcDocument']['id']
 									)) .'</div>';
 								}else{
-									if(in_array($this->Session->read('User.id'),json_decode($qcDocument['QcDocument']['editors'],true))){
+									if(in_array($this->Session->read('User.id'),(array)json_decode((string)$qcDocument['QcDocument']['editors'],true))){ // M9 correction 23: no HTTP 500 on an empty or invalid editors list
 										echo "<br /><br />";
 										echo $this->Form->create('QcDocument',array('action'=>'upload_qc_document','type'=>'file',),array('role'=>'form','class'=>'form'));
 										echo '<div class="col-md-8">'.$this->Form->hidden('file_type',array()).'</div>';?>

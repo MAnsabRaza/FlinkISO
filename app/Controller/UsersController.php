@@ -85,7 +85,7 @@ class UsersController extends AppController {
                 $user['User']['employee_id'] = $employee['Employee']['id'];
                 $user['User']['name'] = $employee['Employee']['name'];
                 $user['User']['username'] = $user['User']['email'] = trim($employee['Employee']['office_email']);
-                $user['User']['password'] = Security::hash(trim($employee['Employee']['office_email']), 'md5', true);
+                $user['User']['password'] = $this->_m9_password_hash(trim($employee['Employee']['office_email']));
                 $user['User']['branch_id'] = $employee['Employee']['branch_id'];
                 $user['User']['department_id'] = $employee['Employee']['department_id'];
                 $user['User']['assigned_branches'] = json_encode(array($employee['Employee']['branch_id']));
@@ -322,10 +322,10 @@ class UsersController extends AppController {
         if ($this->request->is('post')) {
 
             $userData = $this->User->find('first', array('conditions' => array('id' => $this->Session->read('User.id')), 'recursive' => - 1));
-            if ($userData['User']['password'] == Security::hash($this->request->data['User']['current_password'], 'md5', true)) {
+            if ($this->_m9_password_matches($userData['User']['password'], $this->request->data['User']['current_password'])) {
                 $newData = array();
                 $newData['User']['id'] = $userData['User']['id'];
-                $newData['User']['password'] = Security::hash($this->request->data['User']['new_password'], 'md5', true);                
+                $newData['User']['password'] = $this->_m9_password_hash($this->request->data['User']['new_password']);                
                 $old_pwd = $userData['User']['password'];
                 
                 $companyData = $this->User->Company->find('first', array(
@@ -397,7 +397,7 @@ class UsersController extends AppController {
                 )));
 
                 if($user){
-                    $user['User']['password'] = Security::hash($this->request->data['User']['temppassword'], 'md5', true); 
+                    $user['User']['password'] = $this->_m9_password_hash($this->request->data['User']['temppassword']); 
                     $user['User']['pwd_last_modified'] = date('Y-m-d H:i:s');
                     $this->User->create();
                     $this->User->save($user,false);
@@ -592,7 +592,7 @@ class UsersController extends AppController {
                         $this->Session->setFlash(__('Already Logged in. Please wait while your earlier session expires.', true), 'default', array('class' => 'alert-danger'));
                         $this->redirect(array('controller' => 'users', 'action' => 'login'));
                     }
-                    if (trim($user['User']['password']) != trim(Security::hash($this->data['User']['password'], 'md5', true))) {
+                    if (!$this->_m9_password_matches($user['User']['password'], $this->data['User']['password'], $user['User']['id'])) {
                         
                         if ($this->Session->read('Login.username') == $this->data['User']['username'] && $companyData['Company']['limit_login_attempt']) {
                             $this->Session->write('Login.count', $this->Session->read('Login.count') + 1);
@@ -1331,7 +1331,7 @@ class UsersController extends AppController {
                         $user['User']['company_id']               = $companyId;
                         $user['User']['name']                     = $this->request->data['User']['OnPremiseUser']['name'];
                         $user['User']['username']                 = $this->request->data['User']['OnPremiseUser']['email'];
-                        $user['User']['password']                 = Security::hash($this->request->data['User']['OnPremiseUser']['email'], 'md5', true);
+                        $user['User']['password']                 = $this->_m9_password_hash($this->request->data['User']['OnPremiseUser']['email']);
                         $user['User']['is_mr']                    = true;
                         $user['User']['is_mt']                    = true;
                         $user['User']['is_view_all']              = true;

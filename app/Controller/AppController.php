@@ -70,6 +70,14 @@ class AppController extends Controller {
 	public $userids = null;
 	public $message_count = null;
 	public $notification_count = null;
+
+	// M9 corrections 29 to 32 (owner review 9 Nov 2026): state shared by the approval writes and their undo.
+	public $m9PutBackDiff = '';
+	public $m9ApprovalError = '';
+	public $m9ApprovalMessage = '';
+	public $m9Undo = array();
+	public $m9MailQueue = array();
+	public $m9DeferMail = false;
 	public $branchIDYes = false;
 	
 	public function _check_login() {		
@@ -143,7 +151,7 @@ class AppController extends Controller {
 					$user = $this->User->find('count',array(
 						'conditions'=>array(
 							'User.username'=>$callHeaders['user'],
-							'User.password'=>trim(Security::hash($callHeaders['password'], 'md5', true)),
+							'User.password'=>$this->_m9_password_condition(array('User.username'=>$callHeaders['user']), $callHeaders['password']),
 							'User.status'=>1,
 							'User.is_mr'=>1,
 							'User.emp_status'=>1
@@ -190,7 +198,7 @@ class AppController extends Controller {
 					$user = $this->User->find('count',array(
 						'conditions'=>array(
 							'User.username'=>$callHeaders['user'],
-							'User.password'=>trim(Security::hash($callHeaders['password'], 'md5', true)),
+							'User.password'=>$this->_m9_password_condition(array('User.username'=>$callHeaders['user']), $callHeaders['password']),
 							'User.status'=>1,
 							'User.is_mr'=>1,
 							'User.emp_status'=>1
@@ -323,6 +331,91 @@ class AppController extends Controller {
     // ===== M9 access-control corrections 1 to 6 (staging, 26 Oct 2026) =====
     // Refusals and checks are logged to tmp/logs/m9_access.log: time, user, controller/action, page or ajax, method, event,
     // detail. No field values are logged. Administrators (is_mr) are not affected by the guard.
+    // ===== Owner's fifth review (16 Nov 2026), decision 396: no 0777 =====
+    // PHP runs as the site's owner, so nothing the application writes needs group or world write. Every chmod and Folder mode
+    // 0777 of the application is replaced by this: 0755 for a folder, 0644 for a file; never through a symbolic link.
+    public function _m9_mode($p) {
+        $p = (string)$p; clearstatcache(true, $p);
+        if ($p === '' || is_link($p) || !file_exists($p)) return false;
+        return @chmod($p, is_dir($p) ? 0755 : 0644);
+    }
+
+    // M9 full fix: one writer per target file on this host. The lock file lives under app/tmp/m9_locks
+    // (0700) and is held only for the duration of the copy/write, never across a request.
+    public function _m9_file_lock($path, $timeout = 10) {
+        $dir = TMP . 'm9_locks';
+        if (!is_dir($dir)) @mkdir($dir, 0700, true);
+        @chmod($dir, 0700);
+        $fp = @fopen($dir . DS . sha1((string)$path) . '.lock', 'c');
+        if ($fp === false) return false;
+        $end = time() + max(1, (int)$timeout);
+        do {
+            if (flock($fp, LOCK_EX | LOCK_NB)) return $fp;
+            usleep(100000);
+        } while (time() < $end);
+        fclose($fp);
+        return false;
+    }
+
+    public function _m9_file_unlock($lock) {
+        if (is_resource($lock)) { flock($lock, LOCK_UN); fclose($lock); }
+    }
+
+    // ===== Owner's fifth review (16 Nov 2026), decision 393: a copy never follows a symbolic link =====
+    // Copies $src to $base/<$rel>/<$name>. $base must exist. Each folder below it is checked with lstat and
+    // created one level at a time (0755), never through a link. The new file is opened with mode 'x' (O_CREAT|O_EXCL), which fails
+    // on any existing name, a dangling link included, so nothing outside the folder can be written through a link. With $replace
+    // the copy goes to a new temporary name in the same folder and is renamed over the old name: rename replaces a link itself,
+    // never its target. Afterwards the folder is resolved again and size and SHA-256 are compared with the source; on any
+    // difference the new file is removed. Returns array(true, path) or array(false, reason).
+    public function _m9_safe_copy($base, $rel, $name, $src, $replace = false) {
+        // $base comes from the application's own configuration (never from a request); it is resolved once and trusted from there
+        clearstatcache();
+        $base = ((string)$base === '') ? false : realpath((string)$base);
+        $made = array();
+        if ($base === false || !is_dir($base)) return array(false, 'base_missing');
+        if (!is_string($name) || preg_match('/^[A-Za-z0-9][A-Za-z0-9._ -]{0,250}$/', $name) !== 1 || strpos($name, '..') !== false) return array(false, 'bad_name');
+        if (!is_string($src) || is_link($src) || !is_file($src)) return array(false, 'source_not_plain_file');
+        $dir = $base;
+        foreach (((string)$rel === '') ? array() : explode('/', str_replace('\\', '/', (string)$rel)) as $c) {
+            if (preg_match('/^[A-Za-z0-9_-][A-Za-z0-9._-]{0,99}$/', $c) !== 1 || strpos($c, '..') !== false) return $this->_m9_safe_copy_undo($made, 'bad_folder_name');
+            $dir .= '/' . $c;
+            clearstatcache(true, $dir);
+            if (is_link($dir)) return $this->_m9_safe_copy_undo($made, 'link_in_path');
+            if (!file_exists($dir)) {
+                if (@mkdir($dir, 0755)) $made[] = $dir;
+                else { clearstatcache(true, $dir); if (is_link($dir) || !is_dir($dir)) return $this->_m9_safe_copy_undo($made, 'folder_not_created'); }
+            } elseif (!is_dir($dir)) return $this->_m9_safe_copy_undo($made, 'not_a_folder');
+        }
+        $dst = $dir . '/' . $name;
+        $tmp = $replace ? $dir . '/.m9c_' . bin2hex(random_bytes(6)) . '.tmp' : $dst;
+        $lock = $this->_m9_file_lock($dst);
+        if ($lock === false) return $this->_m9_safe_copy_undo($made, 'file_busy');
+        try {
+            clearstatcache(true, $dst);
+            if (!$replace && (file_exists($dst) || is_link($dst))) return $this->_m9_safe_copy_undo($made, 'already_present');
+            $out = @fopen($tmp, 'xb');
+            if ($out === false) return $this->_m9_safe_copy_undo($made, (!$replace && (file_exists($dst) || is_link($dst))) ? 'already_present' : 'open_failed');
+            $in = @fopen($src, 'rb');
+            $n = ($in === false) ? false : stream_copy_to_stream($in, $out);
+            if ($in !== false) fclose($in);
+            fflush($out); fclose($out);
+            clearstatcache();
+            $ok = ($n !== false && realpath($dir) === $dir && !is_link($tmp) && is_file($tmp) && filesize($tmp) === filesize($src) && hash_file('sha256', $tmp) === hash_file('sha256', $src));
+            if ($ok && $replace) $ok = !(is_dir($dst) && !is_link($dst)) && @rename($tmp, $dst);
+            if (!$ok) { @unlink($tmp); return $this->_m9_safe_copy_undo($made, 'copy_not_verified'); }
+            @chmod($dst, 0644);
+            return array(true, $dst);
+        } finally {
+            $this->_m9_file_unlock($lock);
+        }
+    }
+
+    public function _m9_safe_copy_undo($made, $why) {
+        foreach (array_reverse($made) as $d) @rmdir($d);
+        return array(false, $why);
+    }
+
     public function _m9_ac_log($event, $detail = '') {
         $line = implode("\t", array(date('Y-m-d H:i:s'), substr((string)$this->Session->read('User.id'), 0, 8),
             $this->request->params['controller'] . '/' . $this->action, $this->request->is('ajax') ? 'ajax' : 'page',
@@ -444,7 +537,12 @@ class AppController extends Controller {
         $adminOnly = array(
             'users' => array('add', 'edit', 'delete', 'index', 'user_access', 'copy_access_from', 'install_updates', 'reset_access', 'check_username'),
             'qc_documents' => array('update_access', 'add_bulk', 'purge', 'fix_names', 'define_change_history_table'), // purge: M9 review finding 2; fix_names, define_change_history_table: M9 correction 12
-            'custom_tables' => array('update_access', 'updateaccess'),
+            // M9 review R2 (owner review 12 Nov 2026): every action that changes a form, its fields, its scripts, its data-entry settings,
+            // its process links, its lock or its publication. Ten of them (lock, unlock, create_master, save_scripts, reset_table_password,
+            // link_processes, delete_link_processes, process_sequence, updatedataentry, recreate_all_forms) had no administrator check.
+            'custom_tables' => array('update_access', 'updateaccess', 'add', 'add_child', 'edit', 'delete', 'delete_child', 'recreate', 'recreate_child',
+                'recreate_all_forms', 'publish', 'hold', 'lock', 'unlock', 'update_field', 'update_child_field', 'create_master', 'save_scripts',
+                'reset_table_password', 'link_processes', 'delete_link_processes', 'process_sequence', 'updatedataentry', 'restore_form_document'),
         );
         if (isset($adminOnly[$c]) && in_array($a, $adminOnly[$c], true)) $this->_m9_ac_refuse('admin_only');
         // Correction 6: a new revision is published immediately, so it needs the publisher role.
@@ -504,16 +602,21 @@ class AppController extends Controller {
         if ($gone) $this->_m9_ac_log('publish_flag_removed', implode(',', $gone));
         // Correction 6 with correction 1: an approval response is accepted only from the addressee of a pending approval,
         // for that approval's own record and the record's current step. A response that publishes needs the publisher role.
-        $dt = $this->request->data; $ap = null; $outcome = false; $step = null; $rec = null; $ctl = null; $response = false;
+        $dt = $this->request->data; $ap = null; $outcome = false; $answer = false; $step = null; $rec = null; $ctl = null; $response = false;
         if ($c == 'approval_comments' && $a == 'add_response') {
             $response = true;
             $ap = isset($dt['approval_id']) ? $dt['approval_id'] : '';
             $step = isset($dt['approval_step_id']) ? $dt['approval_step_id'] : '';
             $outcome = (isset($dt['approval_status']) && $dt['approval_status'] == 1);
-        } elseif (isset($dt['ApprovalComment']) && is_array($dt['ApprovalComment']) && isset($dt['ApprovalComment']['approval_id'])) {
-            $x = $dt['ApprovalComment']; $ap = $x['approval_id'];
+        } elseif (isset($dt['ApprovalComment']) && is_array($dt['ApprovalComment']) && (isset($dt['ApprovalComment']['approval_id']) || !empty($dt['ApprovalComment']['user_id']))) {
+            // M9 correction 32 (owner review 9 Nov 2026): a comment or response that will be saved (user_id given) must name a
+            // pending approval; before, a post without approval_id skipped every check below.
+            $x = $dt['ApprovalComment']; $ap = isset($x['approval_id']) ? $x['approval_id'] : '';
             $rec = isset($x['record']) ? $x['record'] : ''; $ctl = isset($x['controller_name']) ? $x['controller_name'] : '';
-            $outcome = (isset($x['user_id']) && $x['user_id'] == -1) && ((isset($x['stauts']) && $x['stauts'] == 1) || (isset($x['status']) && $x['status'] == 1));
+            $final = isset($x['user_id']) && is_scalar($x['user_id']) && (string)$x['user_id'] === '-1';
+            $r = $this->_m9_approval_response($x); // correction 31: 'stauts', 'Stauts' or 'status'
+            $outcome = $final && $r === 1;
+            $answer = $final && ($r === 1 || $r === 2);
         }
         if ($ap === null) return;
         if (is_array($ap) || (string)$ap === '') $this->_m9_ac_refuse('approval_missing');
@@ -527,7 +630,7 @@ class AppController extends Controller {
         $A = $A['Approval'];
         $isTo = in_array((string)$A['user_id'], $me, true); $isFrom = in_array((string)$A['from'], $me, true);
         if ($A['approval_status'] != 0) $this->_m9_ac_refuse('approval_not_pending', substr((string)$ap, 0, 8));
-        if ($response || $outcome) { if (false === $isTo) $this->_m9_ac_refuse('approval_not_addressed', substr((string)$ap, 0, 8)); }
+        if ($response || $outcome || $answer) { if (false === $isTo) $this->_m9_ac_refuse('approval_not_addressed', substr((string)$ap, 0, 8)); }
         elseif (false === ($isTo || $isFrom)) $this->_m9_ac_refuse('approval_not_party', substr((string)$ap, 0, 8));
         if ($rec !== null && ((string)$rec !== (string)$A['record'] || (string)$ctl !== (string)$A['controller_name'])) $this->_m9_ac_refuse('approval_record_mismatch', substr((string)$ap, 0, 8));
         $M = ClassRegistry::init($A['model_name']);
@@ -580,6 +683,8 @@ class AppController extends Controller {
         $pass = trim((string)$pass);
         // rename changes a document's title, number and revision: editors only, when the form opens and when it is saved.
         if ($a == 'rename' && false === $this->_m9_doc_editor($pass)) $this->_m9_ac_refuse('not_document_editor', substr($pass, 0, 8));
+        // M9 correction 22 (finding 4, decision of 2 Nov 2026): a publisher may revise only a document they may edit.
+        if ($a == 'update_revision' && false === $post && $pass !== '' && false === $this->_m9_doc_editor($pass)) $this->_m9_ac_refuse('not_document_editor', substr($pass, 0, 8));
         if (false === $post) return;
         $dt = is_array($this->request->data) ? $this->request->data : array();
         $posted = array();
@@ -616,9 +721,13 @@ class AppController extends Controller {
         } elseif (($a == 'view' || $a == 'view_archived') && $sends) {
             // Sending for approval from a document page locks the document: its editors, or a party to a pending approval on it.
             if (false === $this->_m9_doc_editor($t) && false === $this->_m9_doc_pending_party($t, $me)) $this->_m9_ac_refuse('not_document_editor_or_party', substr($t, 0, 8));
-        } elseif ($pass === '' && $t !== '' && false === in_array($a, array('delete', 'delete_document', 'update_revision', 'view', 'view_archived'), true)) {
+        } elseif ($a == 'update_revision') {
+            // M9 correction 22 (finding 4): saving a revision needs the publisher role (correction 6) and the editor right on the
+            // posted document, which must be named.
+            if ($t === '' || false === $this->_m9_doc_editor($t)) $this->_m9_ac_refuse('not_document_editor', substr($t, 0, 8));
+        } elseif ($pass === '' && $t !== '' && false === in_array($a, array('delete', 'delete_document', 'view', 'view_archived'), true)) {
             // Any other request naming a document only in its posted data: editors only. (delete and delete_document check the
-            // document's editors and creator themselves; update_revision needs the publisher role, correction 6.)
+            // document's editors and creator themselves.)
             if (false === $this->_m9_doc_editor($t)) $this->_m9_ac_refuse('not_document_editor', substr($t, 0, 8));
         }
     }
@@ -835,15 +944,23 @@ class AppController extends Controller {
         return array_values(array_unique(array((string)$f['File']['name'] . '.' . $t, $this->_clean_table_names((string)$f['File']['name']) . '.' . $t)));
     }
 	public function beforeFilter() {
+		// M9 review D-1 (owner review 10 Nov 2026): stored files reach the browser only through m9_file (files/.htaccess), which
+		// makes every check itself; nothing else in this filter applies to it.
+		if (strtolower((string)$this->request->params['action']) === 'm9_file') return;
 		// M9 correction 17: callback addresses name the editing user as editor:<id>, because the server firewall (rule 240950) refuses
 		// any address ending in user:<non-digits>. The save handlers read 'user', so the value is passed on under that name.
 		if (isset($this->request->params['named']['editor']) && !isset($this->request->params['named']['user'])) $this->request->params['named']['user'] = $this->request->params['named']['editor'];
 		$this->_m9_onlyoffice_guard(); // M9 correction 13: OnlyOffice callbacks need a valid token
 		$this->_check_login();
-		// M9 correction 18 (X23): server-side check of signed fields on every POST/PUT, as tested on staging on 20 October 2026.
+		$this->_m9_internal_guard(); // M9 review V items (10 Nov 2026): internal helpers are not URL actions
+		$this->_m9_l1_prepare(); // M9 review L1 (10 Nov 2026): a response given on the document page is saved
+		$this->_m9_csrf_guard(); // M9 review O2 and decision 342 (10 Nov 2026): deletes and uploads need the session token
+		$this->_m9_upload_guard(); // M9 review V8 (10 Nov 2026): no script file names, document types from an allow-list
+		// M9 signature protection (staging, 20 Oct 2026): server-side check of signed fields on every POST/PUT.
 		if ($this->Session->read('User')) $this->_m9_signature_guard();
 		// M9 access-control corrections 2, 3 and 6 (staging, 26 Oct 2026): server-side checks before any action runs.
 		if ($this->Session->read('User')) $this->_m9_access_guard();
+		if ($this->Session->read('User')) $this->_m9_designer_guard(); // M9 review R2 (12 Nov 2026): Custom Tables designer, ids must belong together
 		if($this->Session->read('User')){
 			Configure::write("files", WWW_ROOT . 'files' . DS . $this->Session->read('User.company_id'));
 			Configure::write("files_url", Router::url('/', true) . 'files/' . $this->Session->read('User.company_id'));
@@ -877,6 +994,7 @@ class AppController extends Controller {
 					$this->_check_access();
 				}
 			}
+			$this->_m9_retired_guard(); // owner's fourth review (13 Nov 2026): actions no page calls, refused for every user
 			$skip_track_history = array('check_invoice_dateTue','dir_size','advance_search','assigned_tasks','index','jwtencode','field_fetch','check_document','code_input_main');
 			if (
 				!in_array($this->action, $skip_track_history) &&
@@ -1386,69 +1504,152 @@ public function _get_approver_list($creator = null) {
 	
 }
 
-public function _save_approvals($record_id = null) {	
+public function _save_approvals($record_id = null) {
+	// M9 correction 29 (owner review 9 Nov 2026, finding 1): every write is checked. On any failure the approval rows written
+	// by this call are removed and the record is put back as it was read; nothing is reported as sent and no email goes out
+	// (emails are sent only after every write succeeded). True when nothing failed (also when no approver was chosen); false
+	// otherwise, with the reason in m9ApprovalError. Rows written are added to m9Undo, so a caller whose later step fails can
+	// undo them with _m9_undo(). The tables are MyISAM, so there is no transaction; the undo is explicit.
+	// M9 correction 31 (finding 3): the cycle is one more than the highest cycle stored for this record (the original took
+	// count() of a single row, always 1, and looked it up by a posted model name, so it never advanced).
 	$this->loadModel('Approval');
-	// get approval cycle
+	$this->m9ApprovalError = '';
 	$model = $this->modelClass;
-	if(!$record_id)$record_id = $this->request->data['Approval'][$model]['id'];
+	$in = (isset($this->request->data['Approval'][$model]) && is_array($this->request->data['Approval'][$model])) ? $this->request->data['Approval'][$model] : array();
+	if (!$record_id) $record_id = isset($in['id']) ? $in['id'] : null;
 	$this->request->data['Approval'][$model]['record'] = $record_id;
-	// generate some record details as well to add to approval for reference
-	$model = $this->modelClass;
-	$rec = $this->$model->find('first', array('recursive' => - 1, 'conditions' => array($model . '.id' => $this->request->data['Approval'][$model]['id']), 'fields' => array($model . '.id', $model . '.' . $this->$model->displayField)));
+	$users = array();
+	foreach ((isset($in['user_id']) && $in['user_id']) ? (array)$in['user_id'] : array() as $u) if (is_scalar($u) && trim((string)$u) !== '' && (string)$u !== '-1') $users[] = (string)$u;
+	if (empty($users)) return true;
+	if (false === is_scalar($record_id) || (string)$record_id === '') return $this->_m9_approval_fail('record_missing', 'The approval request could not be sent.');
+	$rec = $this->$model->find('first', array('recursive' => -1, 'conditions' => array($model . '.id' => $record_id)));
+	if (empty($rec[$model])) return $this->_m9_approval_fail('record_missing', 'The approval request could not be sent.');
 	$title = $rec[$model][$this->$model->displayField] . ' from ' . Inflector::humanize($this->request->controller) . ' section.';
-	$cycle = $this->Approval->find('first', array('fields' => array('Approval.id', 'Approval.approval_cycle'), 'group' => array('Approval.approval_cycle'), 'order' => array('Approval.approval_cycle' => 'DESC'), 'conditions' => array('Approval.model_name' => $this->request->data[$this->modelClass]['model_name'], 'Approval.record' => $this->request->data[$this->modelClass]['id'])));
+	$last = $this->Approval->find('first', array('recursive' => -1, 'fields' => array('MAX(Approval.approval_cycle) AS m9max'), 'conditions' => array('Approval.model_name' => $model, 'Approval.record' => $record_id)));
+	$cycle_count = (isset($last[0]['m9max']) && $last[0]['m9max'] !== null) ? ((int)$last[0]['m9max'] + 1) : 1;
+	$undo = array(array('put', $model, $rec[$model]));
+	$mails = array();
+	foreach ($users as $approvaluser) {
+		$approvaldata = array('Approval' => array(
+			'title' => $title,
+			'controller_name' => $this->request->controller,
+			'model_name' => $model,
+			'record' => $record_id,
+			'from' => isset($in['from']) ? $in['from'] : null,
+			'user_id' => $approvaluser,
+			'approval_status' => 0,
+			'approval_mode' => isset($in['approval_mode']) ? $in['approval_mode'] : null,
+			'approval_type' => isset($in['approval_type']) ? $in['approval_type'] : null,
+			'comments' => isset($in['comments']) ? $in['comments'] : null,
+			'approval_step_id' => isset($in['approval_step_id']) ? $in['approval_step_id'] : null,
+			'approval_cycle' => $cycle_count,
+		));
+		$this->Approval->create();
+		$ok = false;
+		try { $ok = (bool)$this->Approval->save($approvaldata, false); } catch (Exception $m9e) { $ok = false; }
+		if (!$ok) { $this->_m9_undo_list($undo); return $this->_m9_approval_fail('approval_save_failed', 'The approval request could not be sent.'); }
+		$undo[] = array('delete', 'Approval', $this->Approval->id);
+		$mails[] = array($approvaluser, $approvaldata['Approval']['comments'], $model);
+	}
+	// lock record: only the two lock columns are written, without validation, and the write is checked
+	$ok = false;
+	try {
+		$this->$model->create(false);
+		$ok = (bool)$this->$model->save(array($model => array('id' => $record_id, 'record_status' => 1, 'publish' => 0)), array('validate' => false, 'fieldList' => array('record_status', 'publish')));
+	} catch (Exception $m9e) { $ok = false; }
+	if (!$ok) { $this->_m9_undo_list($undo); return $this->_m9_approval_fail('record_lock_failed', 'The approval request could not be sent.'); }
+	foreach ($undo as $u) $this->m9Undo[] = $u;
+	foreach ($mails as $m) $this->m9MailQueue[] = $m;
+	if (false === $this->m9DeferMail) $this->_m9_send_mail_queue();
+	$this->Session->setFlash(__('Approval created.'));
+	return true;
+}
 
-	if ($cycle) $cycle_count = count($cycle) + 1;
-	else $cycle_count = 1;
-	
-	if ($this->request->data['Approval'][$model]['user_id']) {
-		$approvalusers = $this->request->data['Approval'][$model]['user_id'];		
+// M9 correction 29: helpers for the approval writes. A failure is logged and flashed; begin, commit and abort bracket a
+// request that makes several approval writes (the document pages), so that a later failure undoes the earlier writes.
+public function _m9_approval_fail($why, $message) {
+	$this->m9ApprovalError = $why;
+	$this->m9ApprovalMessage = $message;
+	$this->_m9_ac_log('approval_write_failed', $why);
+	$this->Session->setFlash(__($message));
+	return false;
+}
+public function _m9_approval_abort_flash() {
+	$ok = $this->_m9_undo();
+	$this->Session->setFlash(__($this->m9ApprovalMessage !== '' ? $this->m9ApprovalMessage : 'The approval could not be saved.') . ' ' . ($ok ? __('No change was made.') : __('Some changes could not be undone; this is recorded in the application log.')));
+	return $ok;
+}
+public function _m9_approval_begin() {
+	$this->m9Undo = array(); $this->m9MailQueue = array(); $this->m9DeferMail = true;
+	$this->m9ApprovalError = ''; $this->m9ApprovalMessage = '';
+}
+public function _m9_approval_commit() {
+	$this->m9Undo = array(); $this->m9DeferMail = false;
+	$this->_m9_send_mail_queue();
+}
+public function _m9_undo() {
+	$l = $this->m9Undo; $this->m9Undo = array(); $this->m9MailQueue = array(); $this->m9DeferMail = false;
+	return $this->_m9_undo_list($l);
+}
+public function _m9_undo_list($list) {
+	$ok = true;
+	foreach (array_reverse($list) as $u) {
+		try {
+			if ($u[0] === 'delete') {
+				$M = ClassRegistry::init($u[1]);
+				$M->deleteAll(array($M->alias . '.id' => $u[2]), false, false);
+				if ($M->find('count', array('recursive' => -1, 'conditions' => array($M->alias . '.id' => $u[2]))) > 0) $ok = false;
+			} elseif (false === $this->_m9_put_back($u[1], $u[2])) $ok = false;
+		} catch (Exception $m9e) { $ok = false; }
 	}
-	
-	if ($this->request->data['Approval'][$model]['user_id']) {
-		$approvalusers = $this->request->data['Approval'][$model]['user_id'];
-		foreach ($approvalusers as $approvaluser) {
-			if ($approvaluser != - 1) {
-				$approvaldata['Approval']['title'] = $title;
-				$approvaldata['Approval']['controller_name'] = $this->request->controller;
-				$approvaldata['Approval']['model_name'] = $this->modelClass;
-				$approvaldata['Approval']['record'] = $record_id;
-				$approvaldata['Approval']['from'] = $this->request->data['Approval'][$model]['from'];
-				$approvaldata['Approval']['user_id'] = $approvaluser;
-				$approvaldata['Approval']['approval_status'] = 0;
-				$approvaldata['Approval']['approval_mode'] = $this->request->data['Approval'][$model]['approval_mode'];
-				$approvaldata['Approval']['approval_type'] = $this->request->data['Approval'][$model]['approval_type'];
-				$approvaldata['Approval']['comments'] = $this->request->data['Approval'][$model]['comments'];
-				$approvaldata['Approval']['approval_mode'] = $this->request->data['Approval'][$model]['approval_mode'];
-				$approvaldata['Approval']['approval_step_id'] = $this->request->data['Approval'][$model]['approval_step_id'];
-				$approvaldata['Approval']['approval_cycle'] = $cycle_count;
-				
-				$this->Approval->create();
-				if($this->Approval->save($approvaldata,false)){
-					$this->Session->setFlash(__('Approval created.'));
-				}else{
-					$this->Session->setFlash(__('Approval could not be sent.'));
-				}
-				$this->_sent_approval_email(
-					$approvaldata['Approval']['user_id'],
-					0,
-					$approvaldata['Approval']['comments'], 
-					$approvaldata['Approval']['model_name']
-				);
-				// lock record
-				$model = $approvaldata['Approval']['model_name'];
-				$this->loadModel($model);
-				$rec = $this->$model->find('first', array('conditions' => array($model . '.id' => $this->request->data['Approval'][$model]['record']), 'recursive' => - 1));
-				if ($rec) {
-					$rec[$model]['record_status'] = 1;
-					$rec[$model]['publish'] = 0;
-					// $rec[$this->modelClass]['record_status'] = 1;
-					$this->$model->create();
-					$this->$model->save($rec);
-				}
+	if (!$ok) $this->_m9_ac_log('approval_undo_failed', substr((string)$this->m9PutBackDiff, 0, 120));
+	return $ok;
+}
+public function _m9_send_mail_queue() {
+	$q = $this->m9MailQueue; $this->m9MailQueue = array();
+	foreach ($q as $m) {
+		try { $this->_sent_approval_email($m[0], 0, $m[1], $m[2]); } catch (Exception $m9e) { $this->_m9_ac_log('approval_mail_failed', substr((string)$m[0], 0, 8)); }
+	}
+}
+// M9 correction 31 (finding 3): the response radio is posted as 'stauts' by one panel of approval_form.ctp and as 'Stauts'
+// by the other; 'status' is also accepted. 1 = Approved, 2 = Not Approved, anything else = no response.
+public function _m9_approval_response($x) {
+	if (false === is_array($x)) return 0;
+	foreach (array('stauts', 'Stauts', 'status') as $k) if (isset($x[$k]) && is_scalar($x[$k]) && in_array((string)$x[$k], array('1', '2'), true)) return (int)$x[$k];
+	return 0;
+}
+// M9 corrections 27, 28 and 30 (owner, 6 and 9 Nov 2026): put one stored row back exactly as it was read, then read it again and
+// compare every column. First updateAll (no callbacks, no automatic modified date); if the row still differs, a save of the
+// original row with validation and callbacks off (modified kept as given). A row already equal is not written. True only if
+// the row equals the original; otherwise m9PutBackDiff names the columns that differ (or the error) for the log.
+// Correction 30 (finding 2): NULL and the empty string are different values; a column counts as equal only if both are NULL,
+// or neither is NULL and the text is the same. Moved here from QcDocumentsController so the approval undo can use it.
+public function _m9_put_back($model, $row) {
+	$this->m9PutBackDiff = '';
+	if (false === is_array($row) || empty($row['id'])) { $this->m9PutBackDiff = 'no_original'; return false; }
+	try {
+		$this->loadModel($model);
+		$diff = function () use ($model, $row) {
+			$now = $this->$model->find('first', array('recursive' => -1, 'conditions' => array($model . '.id' => $row['id'])));
+			if (empty($now[$model])) return array('row_missing');
+			$d = array();
+			foreach ($row as $k => $v) {
+				$c = array_key_exists($k, $now[$model]) ? $now[$model][$k] : null;
+				if (($v === null) !== ($c === null) || (string)$v !== (string)$c) $d[] = $k;
 			}
-		} 
-	}
+			return $d;
+		};
+		if (!$diff()) return true;
+		$dbs = $this->$model->getDataSource(); $set = array();
+		foreach ($row as $k => $v) if ($k !== 'id' && $k !== 'sr_no') $set[$model . '.' . $k] = $dbs->value($v); // value(null) gives NULL, value('') gives ''
+		try { $this->$model->updateAll($set, array($model . '.id' => $row['id'])); } catch (Exception $m9e) { $this->m9PutBackDiff = 'updateAll_error '; }
+		if (!$diff()) return true;
+		$this->$model->create(false);
+		$this->$model->save(array($model => $row), array('validate' => false, 'callbacks' => false));
+		$d = $diff(); if (!$d) return true;
+		$this->m9PutBackDiff .= 'differs:' . implode(',', array_slice($d, 0, 8));
+		return false;
+	} catch (Exception $m9e) { $this->m9PutBackDiff .= 'error:' . substr(get_class($m9e), 0, 40); return false; }
 }
 
 public function _sent_approval_email($to = null,$message = null,$response = null,$model = null){
@@ -1495,102 +1696,81 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 		$this->set('approvalComments', $approvalComments);
 	}
 	
-	public function _save_approval_comments() {	
-		if ($this->request->data['ApprovalComment']['user_id'] != - 1 && $this->request->data['ApprovalComment']['status'] != 1) {
-			$approvaldata['ApprovalComment']['approval_id'] = $this->request->data['ApprovalComment']['approval_id'];
-			$approvaldata['ApprovalComment']['controller_name'] = $this->request->data['ApprovalComment']['controller_name'];
-			$approvaldata['ApprovalComment']['model_name'] = $this->request->data['ApprovalComment']['model_name'];
-			$approvaldata['ApprovalComment']['record'] = $this->request->data['ApprovalComment']['record'];
-			$approvaldata['ApprovalComment']['from'] = $this->request->data['ApprovalComment']['from'];
-			$approvaldata['ApprovalComment']['user_id'] = $this->request->data['ApprovalComment']['user_id'];
-			$approvaldata['ApprovalComment']['approval_status'] = 0;
-			$approvaldata['ApprovalComment']['approval_mode'] = $this->request->data['ApprovalComment']['approval_mode'];
-			$approvaldata['ApprovalComment']['approval_type'] = $this->request->data['ApprovalComment']['approval_type'];
-			$approvaldata['ApprovalComment']['comments'] = $this->request->data['ApprovalComment']['comments'];
-			$approvaldata['ApprovalComment']['approval_mode'] = $this->request->data['ApprovalComment']['approval_mode'];
-			$approvaldata['ApprovalComment']['approval_cycle'] = $cycle_count;
-			$approvaldata['ApprovalComment']['response_status'] = 0;
-			$this->loadModel('ApprovalComment');
+	public function _save_approval_comments() {
+		// M9 corrections 29, 31 and 32 (owner review 9 Nov 2026). Every write is checked and undone on failure (29). The response
+		// is read from 'stauts', 'Stauts' or 'status'; "Not Approved" now records the rejection, which the original could never
+		// reach; the dead block (if 1 < 0) and the undefined $cycle_count (approval_comments has no approval_cycle column) are
+		// removed (31). The approval must exist; record, controller and model are taken from the stored approval, never from the
+		// post, and the publish check uses model conditions, not SQL built from posted text (32). The record is published only
+		// when every approval of its cycle is closed and none was answered Not Approved.
+		$this->m9ApprovalError = '';
+		$in = (isset($this->request->data['ApprovalComment']) && is_array($this->request->data['ApprovalComment'])) ? $this->request->data['ApprovalComment'] : array();
+		$to = isset($in['user_id']) ? $in['user_id'] : '';
+		if (false === is_scalar($to) || trim((string)$to) === '') return true;
+		$this->loadModel('ApprovalComment'); $this->loadModel('Approval');
+		$apid = isset($in['approval_id']) ? $in['approval_id'] : '';
+		$A = (is_scalar($apid) && (string)$apid !== '') ? $this->Approval->find('first', array('recursive' => -1, 'conditions' => array('Approval.id' => $apid))) : array();
+		if (empty($A['Approval'])) return $this->_m9_approval_fail('approval_missing', 'The response could not be saved.');
+		$A = $A['Approval'];
+		$base = array(
+			'approval_id' => $A['id'],
+			'controller_name' => $A['controller_name'],
+			'model_name' => $A['model_name'],
+			'record' => $A['record'],
+			'from' => isset($in['from']) ? $in['from'] : null,
+			'approval_mode' => isset($in['approval_mode']) ? $in['approval_mode'] : null,
+			'approval_type' => isset($in['approval_type']) ? $in['approval_type'] : null,
+			'comments' => isset($in['comments']) ? $in['comments'] : null,
+		);
+		if ((string)$to !== '-1') {
+			// A comment to another user. The original status blocks in this branch read 'status', which no form posts, so they
+			// never ran; a response is given with user -1 (below).
 			$this->ApprovalComment->create();
-			$this->ApprovalComment->save($approvaldata);			
-			if ($this->request->data['ApprovalComment']['status'] == 1) {
-				// update approval record
-				$app = $this->ApprovalComment->Approval->find('first', array('recursive' => - 1, 'conditions' => array('Approval.id' => $this->request->data['ApprovalComment']['approval_id'])));
-				$app['Approval']['status'] = 1;
-				$this->ApprovalComment->Approval->create();
-				$this->ApprovalComment->Approval->save($app);
-			}
-			if ($this->request->data['ApprovalComment']['status'] == 2) {
-				// update approval record
-				$app = $this->ApprovalComment->Approval->find('first', array('recursive' => - 1, 'conditions' => array('Approval.id' => $this->request->data['ApprovalComment']['approval_id'])));
-				$app['Approval']['status'] = 1;
-				$this->ApprovalComment->Approval->create();
-				$this->ApprovalComment->Approval->save($app);
-			}
-			if (1 < 0) {
-				// lock record
-				$model = $approvaldata['Approval']['model_name'];
+			$ok = false;
+			try { $ok = (bool)$this->ApprovalComment->save(array('ApprovalComment' => $base + array('user_id' => (string)$to, 'approval_status' => 0, 'response_status' => 0))); } catch (Exception $m9e) { $ok = false; }
+			if (!$ok) return $this->_m9_approval_fail('comment_save_failed', 'The comment could not be saved.');
+			$this->m9Undo[] = array('delete', 'ApprovalComment', $this->ApprovalComment->id);
+			return true;
+		}
+		$resp = $this->_m9_approval_response($in);
+		if ($resp !== 1 && $resp !== 2) return $this->_m9_approval_fail('no_response', 'Select Approved or Not Approved before saving the response.');
+		if ((string)$A['status'] === '1') return $this->_m9_approval_fail('approval_closed', 'This approval has already been answered.');
+		$undo = array();
+		$this->ApprovalComment->create();
+		$ok = false;
+		try { $ok = (bool)$this->ApprovalComment->save(array('ApprovalComment' => $base + array('user_id' => ($resp === 1 ? 'Approved' : 'Not Approved'), 'approval_status' => $resp)), false); } catch (Exception $m9e) { $ok = false; }
+		if (!$ok) return $this->_m9_approval_fail('comment_save_failed', 'The response could not be saved.');
+		$undo[] = array('delete', 'ApprovalComment', $this->ApprovalComment->id);
+		$undo[] = array('put', 'Approval', $A);
+		$now = date('Y-m-d H:i:s');
+		$ok = false;
+		try {
+			$this->Approval->create(false);
+			$ok = (bool)$this->Approval->save(array('Approval' => array('id' => $A['id'], 'status' => 1, 'approved_date_time' => $now, 'modified' => $now)), array('validate' => false, 'fieldList' => array('status', 'approved_date_time', 'modified')));
+		} catch (Exception $m9e) { $ok = false; }
+		if (!$ok) { $this->_m9_undo_list($undo); return $this->_m9_approval_fail('approval_update_failed', 'The response could not be saved.'); }
+		if ($resp === 1) {
+			$ids = $this->Approval->find('list', array('recursive' => -1, 'fields' => array('Approval.id', 'Approval.status'), 'conditions' => array(
+				'Approval.record' => $A['record'], 'Approval.controller_name' => $A['controller_name'], 'Approval.approval_cycle' => $A['approval_cycle'])));
+			$closed = 0; foreach ($ids as $s) if ((string)$s === '1') $closed++;
+			$rejected = $ids ? $this->ApprovalComment->find('count', array('recursive' => -1, 'conditions' => array('ApprovalComment.approval_id' => array_keys($ids), 'ApprovalComment.user_id' => 'Not Approved'))) : 0;
+			if (count($ids) > 0 && $closed === count($ids) && $rejected === 0) {
+				// approved by all: publish the record
+				$model = $A['model_name'];
 				$this->loadModel($model);
-				$rec = $this->$model->find('first', array('conditions' => array($model . '.id' => $this->request->data['ApprovalComment']['record']), 'recursive' => - 1));
-				$rec[$model]['record_status'] = 1;				
-				$this->$model->create();
-				$this->$model->save($rec);
-			}			
-			
-		} else if ($this->request->data['ApprovalComment']['user_id'] == - 1 && $this->request->data['ApprovalComment']['stauts'] == 1) {
-			// this means record is approved
-			$approvaldata['ApprovalComment']['approval_id'] = $this->request->data['ApprovalComment']['approval_id'];
-			$approvaldata['ApprovalComment']['controller_name'] = $this->request->data['ApprovalComment']['controller_name'];
-			$approvaldata['ApprovalComment']['model_name'] = $this->request->data['ApprovalComment']['model_name'];
-			$approvaldata['ApprovalComment']['record'] = $this->request->data['ApprovalComment']['record'];
-			$approvaldata['ApprovalComment']['from'] = $this->request->data['ApprovalComment']['from'];
-			if ($this->request->data['ApprovalComment']['stauts'] == 1) {
-				$approvaldata['ApprovalComment']['user_id'] = 'Approved';
-				$approvaldata['ApprovalComment']['approval_status'] = $this->request->data['ApprovalComment']['stauts'];
-			} else if ($this->request->data['ApprovalComment']['stauts'] == 2) {
-				$approvaldata['ApprovalComment']['user_id'] = 'Not Approved';
-				$approvaldata['ApprovalComment']['approval_status'] = $this->request->data['ApprovalComment']['stauts'];
-			}
-			$approvaldata['ApprovalComment']['approval_mode'] = $this->request->data['ApprovalComment']['approval_mode'];
-			$approvaldata['ApprovalComment']['approval_type'] = $this->request->data['ApprovalComment']['approval_type'];
-			$approvaldata['ApprovalComment']['comments'] = $this->request->data['ApprovalComment']['comments'];
-			$approvaldata['ApprovalComment']['approval_mode'] = $this->request->data['ApprovalComment']['approval_mode'];
-			$approvaldata['ApprovalComment']['approval_cycle'] = $cycle_count;			
-			$this->loadModel('ApprovalComment');
-			$this->ApprovalComment->create();
-			if ($this->ApprovalComment->save($approvaldata, false)) {
-				// first updated approval record
-				$appRec = $this->ApprovalComment->Approval->find('first', array('recursive' => - 1, 'conditions' => array('Approval.id' => $this->request->data['ApprovalComment']['approval_id']),));
-				$appRec['Approval']['status'] = 1;
-				$appRec['Approval']['approved_date_time'] = $appRec['Approval']['modified'] = date('Y-m-d H:i:s');
-				$this->ApprovalComment->Approval->create();
-				// later add				
-				if ($this->ApprovalComment->Approval->save($appRec, false)) {
-				} else {
-					echo "failed";
-					exit;
-				}
-				// if approved
-				// check if all other approvals are approved or pending
-				// if all other approvals are approved, mark record as PUBLISHED
-				// else no nothing
-				// check if all approved
-				$this->ApprovalComment->Approval->virtualFields = array('all' => 'select count(*) from approvals where approvals.record LIKE "' . $this->request->data['ApprovalComment']['record'] . '" AND approvals.controller_name LIKE "' . $this->request->data['ApprovalComment']['controller_name'] . '"', 'approved' => 'select count(*) from approvals where approvals.record LIKE "' . $this->request->data['ApprovalComment']['record'] . '" AND approvals.controller_name LIKE "' . $this->request->data['ApprovalComment']['controller_name'] . '" AND approvals.status = 1',);
-				$allApprovals = $this->ApprovalComment->Approval->find('first', array('recursive' => - 1, 'fields' => array('Approval.id', 'Approval.controller_name', 'Approval.record', 'Approval.status', 'Approval.all', 'Approval.approved',), 'conditions' => array('Approval.controller_name' => $this->request->data['ApprovalComment']['controller_name'], 'Approval.record' => $this->request->data['ApprovalComment']['record'],)));
-				if ($allApprovals['Approval']['all'] == $allApprovals['Approval']['approved']) {
-					// this means record is approved by all
-					// publish the record
-					$model = $approvaldata['ApprovalComment']['model_name'];
-					$this->loadModel($model);
-					$rec = $this->$model->find('first', array('conditions' => array($model . '.id' => $this->request->data['ApprovalComment']['record']), 'recursive' => - 1));
-					$rec[$model]['publish'] = 1;
-					// $rec[$this->modelClass]['record_status'] = 1;
-					$this->$model->create();
-					$this->$model->save($rec);
-				} else {
-				}
+				$rec = $this->$model->find('first', array('recursive' => -1, 'conditions' => array($model . '.id' => $A['record'])));
+				if (empty($rec[$model])) { $this->_m9_undo_list($undo); return $this->_m9_approval_fail('record_missing', 'The response could not be saved.'); }
+				$undo[] = array('put', $model, $rec[$model]);
+				$ok = false;
+				try {
+					$this->$model->create(false);
+					$ok = (bool)$this->$model->save(array($model => array('id' => $A['record'], 'publish' => 1)), array('validate' => false, 'fieldList' => array('publish')));
+				} catch (Exception $m9e) { $ok = false; }
+				if (!$ok) { $this->_m9_undo_list($undo); return $this->_m9_approval_fail('publish_failed', 'The response could not be saved.'); }
 			}
 		}
+		foreach ($undo as $u) $this->m9Undo[] = $u;
+		return true;
 	}
 
 	public function _show_evidence() {
@@ -1734,7 +1914,14 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 	
 	public function jwtencode($payload = null) {
 		$payload = json_decode(base64_decode($this->request->params['named']['payload']),true);
-        if ($this->_m9_oo_callback_shaped($payload)) $this->_m9_oo_refuse('jwtencode_callback_payload'); // M9 correction 13b
+        // M9 correction 13b refuses to sign a payload shaped like a document server callback, so that no one can make a callback token
+        // through this action. M9 run s78 (13 Nov 2026): that also refused the conversion request of PdfTemplatesController::_convert_to_html
+        // (its top-level 'key' and 'url'), so PDF template add, edit and the cover template could never be converted. Allowed now only for
+        // an internal sub-request (requestAction from the application's own code; the token goes to the document server, never to the
+        // browser) carrying a conversion request: 'outputtype' and 'filetype' present, none of the keys only a callback has.
+        $m9conv = $this->request->is('requested') && is_array($payload) && isset($payload['outputtype'], $payload['filetype'])
+            && false === (bool)array_intersect(array_keys($payload), array('status', 'changesurl', 'payload', 'users', 'actions', 'history'));
+        if (false === $m9conv && $this->_m9_oo_callback_shaped($payload)) $this->_m9_oo_refuse('jwtencode_callback_payload'); // M9 correction 13b
 		$payload['iat'] = time();
         $payload['exp'] = time() + (60 * 60);
         $token = $this->generateJWT($payload);
@@ -1827,6 +2014,7 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 	}
 	
 	public function get_directory_tree($id = null) {
+		if (false === $this->_isValidUuid($id)) return ''; // M9 review: a record id only
 		$x = 0;
 		$path = Configure::read('path') . DS . $id . DS . 'addtional_documents';
 		if (file_exists($path)) {
@@ -1837,44 +2025,594 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 		}
 	}
 	
+	// M9 review V5 (10 Nov 2026): an upload goes only into the additional-documents folder of an existing record of this
+	// controller. The folder path may hold only letters, digits, '_' and '-' between '/'; the file name may not start with a
+	// dot or carry a script extension anywhere in it; the final folder must resolve inside path/<record>/addtional_documents.
+	// Before, the posted id and path were joined unchecked and the client's file name was used as given.
+	// Decision 333 (10 Nov 2026): a non-administrator may upload only on qc_documents, to a document they may view.
 	public function upload_document($id = null) {
 		$this->layout = 'ajax';
-		if ($this->request->data['id'] && $this->request->data['file'] && $this->request->data['path']) {
-			$path = ltrim(rtrim(str_replace(' ', '_', $this->request->data['path'])));
-			$path = Configure::read('path') . DS . $this->request->data['id'] . DS . 'addtional_documents' . DS . $path;
-			if (file_exists($path)) {
-				echo "path exits";
-			} else {
-				$folder = new Folder($path);
-				if ($folder->create($path)) {
-					echo "new Folder Created";
-				} else {
-					echo "folder creation failed";
-				}
+		$d = is_array($this->request->data) ? $this->request->data : array();
+		$rid = (isset($d['id']) && is_scalar($d['id'])) ? trim((string)$d['id']) : '';
+		$sub = (isset($d['path']) && is_scalar($d['path'])) ? trim(str_replace(' ', '_', (string)$d['path']), " /") : '';
+		$up = (isset($d['file']) && is_array($d['file'])) ? $d['file'] : array();
+		if ($rid !== '' && $sub !== '' && $up) {
+			$name = isset($up['name']) && is_scalar($up['name']) ? (string)$up['name'] : '';
+			$why = '';
+			if (false === $this->_isValidUuid($rid)) $why = 'record';
+			elseif (false === $this->_m9_record_exists($rid)) $why = 'record_unknown';
+			elseif (false === $this->_m9_addl_allowed($rid)) $why = 'not_permitted'; // decision 333
+			elseif (preg_match('#^[A-Za-z0-9_-]{1,100}(/[A-Za-z0-9_-]{1,100}){0,9}$#', $sub) !== 1) $why = 'path';
+			elseif ($name === '' || $name !== basename($name) || $name[0] === '.' || strlen($name) > 200 || preg_match('/[\x00-\x1f\\\\\/:*?"<>|]/', $name) === 1) $why = 'name';
+			elseif (preg_match('/\.(php[0-9]?|phtml|phar|pht|phps|cgi|pl|py|sh|bash|shtml|asp|aspx|jsp|htaccess|htpasswd|ini|user\.ini)(\.|$)/i', $name) === 1) $why = 'type';
+			elseif (false === isset($up['tmp_name']) || false === is_scalar($up['tmp_name']) || false === is_uploaded_file((string)$up['tmp_name'])) $why = 'upload';
+			if ($why === '') {
+				$dir = Configure::read('path') . DS . $rid . DS . 'addtional_documents' . DS . str_replace('/', DS, $sub);
+				if (is_dir($dir)) echo "path exits";
+				else { $folder = new Folder(); echo $folder->create($dir) ? "new Folder Created" : "folder creation failed"; }
+				$real = $this->_m9_addl_path($dir, true);
+				if ($real === false) $why = 'folder';
+				elseif (file_exists($real . DS . $name)) $why = 'exists'; // M9 review O4: an existing file is never replaced
+				elseif (false === move_uploaded_file((string)$up['tmp_name'], $real . DS . $name)) $why = 'move';
 			}
-			move_uploaded_file($this->request['data']['file']['tmp_name'], $path . DS . $this->request['data']['file']['name']);
+			if ($why !== '') { $this->_m9_ac_log('upload_refused', $why); echo " upload refused"; }
 		}
-		$this->set('data', array('id' => $this->request->data['id']));
+		$this->set('data', array('id' => $rid));
 		$this->render('/Elements/fileuploads');
 	}
-	
+
+	// M9 review V6 (10 Nov 2026): delete a file or a folder only inside path/<record>/addtional_documents/..., and only from the
+	// page's own AJAX call (a link opened from another site carries no X-Requested-With header). Before, any decoded path was
+	// deleted, by a plain GET.
 	public function delete_uploaded_file($file = null) {
 		$this->autoRender = false;
-		$file = base64_decode($file);
-		$file = str_replace(Configure::read('url'), Configure::read('path'), $file);
-		unlink($file);
-		return true;
+		if (false === $this->request->is('ajax')) $this->_m9_ac_refuse('delete_not_ajax', 'file');
+		if (false === $this->request->is('post')) $this->_m9_ac_refuse('delete_not_post', 'file'); // M9 review O2
+		$p = str_replace(Configure::read('url'), Configure::read('path'), (string)base64_decode((string)$file));
+		$real = $this->_m9_addl_path($p, false);
+		if ($real === false || false === is_file($real)) { $this->_m9_ac_log('delete_refused', 'file'); return false; }
+		if (false === $this->_m9_addl_allowed($this->_m9_addl_record($real))) { $this->_m9_ac_log('delete_refused', 'not_permitted'); return false; } // decision 333
+		return unlink($real);
 	}
-	
+
 	public function delete_uploaded_folder($folder = null) {
 		$this->autoRender = false;
-		$folder = base64_decode($folder);
-		$folder = str_replace(Configure::read('url'), Configure::read('path'), $folder);
-		if (file_exists($folder)) {
-			$path = new Folder($folder);
-			$path->delete($folder);
-		} else {
-			echo "Folder not found";
+		if (false === $this->request->is('ajax')) $this->_m9_ac_refuse('delete_not_ajax', 'folder');
+		if (false === $this->request->is('post')) $this->_m9_ac_refuse('delete_not_post', 'folder'); // M9 review O2
+		$p = str_replace(Configure::read('url'), Configure::read('path'), (string)base64_decode((string)$folder));
+		$real = $this->_m9_addl_path($p, false);
+		if ($real === false || false === is_dir($real)) { echo "Folder not found"; return false; }
+		if (false === $this->_m9_addl_allowed($this->_m9_addl_record($real))) { $this->_m9_ac_log('delete_refused', 'not_permitted'); return false; } // decision 333
+		$path = new Folder($real);
+		return $path->delete($real);
+	}
+
+	// M9 review V5/V6: the real path of $p if it lies strictly inside path/<record id>/addtional_documents of this controller,
+	// otherwise false. With $atRoot the additional-documents folder itself is accepted (upload target), otherwise not
+	// (delete target). Every component is checked as text first ('..', '.', empty), then the resolved path is checked, so a
+	// link inside the folder cannot lead outside it.
+	// M9 review L1 (owner review 10 Nov 2026): the approval box on the document page posts the response as
+	// ApprovalComment.stauts (or Stauts) with no user and no approval, so view() never called _save_approval_comments and nothing
+	// was saved although the page said "Approval Saved". Such a post now becomes the final response (user -1) of the logged-in
+	// user to their own latest pending approval on that document, before the approval checks of correction 32 run on it (the
+	// addressee, the approval still pending, the same record). With none pending, nothing is saved and the page says so.
+	public function _m9_l1_prepare() {
+		if ((string)$this->request->params['controller'] !== 'qc_documents' || false === in_array((string)$this->action, array('view', 'view_archived'), true)) return;
+		if (false === $this->request->is(array('post', 'put')) || false === isset($this->request->data['ApprovalComment']) || false === is_array($this->request->data['ApprovalComment'])) return;
+		$to = isset($this->request->data['ApprovalComment']['user_id']) ? $this->request->data['ApprovalComment']['user_id'] : '';
+		if (is_scalar($to) && trim((string)$to) !== '') return;
+		if (false === in_array($this->_m9_approval_response($this->request->data['ApprovalComment']), array(1, 2), true)) return;
+		$doc = (isset($this->request->params['pass'][0]) && is_scalar($this->request->params['pass'][0])) ? (string)$this->request->params['pass'][0] : '';
+		$l1 = $this->_m9_l1_pending($doc);
+		if ($l1 === '') {
+			$this->_m9_ac_log('approval_write_failed', 'no_pending_approval');
+			$this->Session->setFlash(__('There is no approval waiting for your response on this document. Nothing was saved.'));
+			$this->redirect(array('controller' => 'qc_documents', 'action' => (string)$this->action, $doc));
+			return;
+		}
+		$this->request->data['ApprovalComment']['user_id'] = '-1';
+		$this->request->data['ApprovalComment']['approval_id'] = $l1;
+		$this->request->data['ApprovalComment']['record'] = $doc;
+		$this->request->data['ApprovalComment']['controller_name'] = 'qc_documents';
+		$this->request->data['ApprovalComment']['model_name'] = 'QcDocument';
+	}
+
+	// M9 review L1: the latest pending approval on document $doc addressed to the logged-in user (same rule as
+	// _m9_doc_pending_party), or ''.
+	public function _m9_l1_pending($doc) {
+		if (false === is_scalar($doc) || false === $this->_isValidUuid((string)$doc)) return '';
+		$me = array_values(array_filter(array((string)$this->Session->read('User.id'), (string)$this->Session->read('User.employee_id'))));
+		if (empty($me)) return '';
+		$a = ClassRegistry::init('Approval')->find('first', array('recursive' => -1, 'fields' => array('Approval.id'), 'order' => array('Approval.created' => 'DESC'),
+			'conditions' => array('Approval.record' => (string)$doc, 'Approval.controller_name' => 'qc_documents', 'Approval.approval_status' => 0,
+				'Approval.soft_delete' => 0, 'OR' => array('Approval.status' => null, 'Approval.status !=' => 1), 'Approval.user_id' => $me)));
+		return empty($a['Approval']['id']) ? '' : (string)$a['Approval']['id'];
+	}
+
+	// M9 review O2 and decision 342 (owner review 10 Nov 2026): a request that deletes, or uploads an additional file, must carry
+	// the session's token (header X-M9-Token from the page's AJAX calls, or the form field m9tk that the layout adds to every
+	// form). A link opened from another site carries neither. Actions that delete on a plain GET (listed) need the token for
+	// any method; the other delete actions only change data on POST, so a GET still shows their confirmation page. The token is
+	// made once per session and printed by the default layout. Refusals are logged as refused_csrf_token.
+	public function _m9_csrf_guard() {
+		// M9 review R1 (owner review 12 Nov 2026). CakePHP lets a request header rename the method; nothing in FlinkISO sends it, so a
+		// request that carries it is refused. users/send_otp runs before login (no token exists yet) and writes a one-time code: POST only.
+		if ((string)env('HTTP_X_HTTP_METHOD_OVERRIDE') !== '') $this->_m9_ac_refuse('method_override');
+		// M9 run s78 (13 Nov 2026): an internal sub-request (requestAction, made by code that is already running inside a request this
+		// guard passed) carries no token of its own and inherits the outer method. Revision 6 refused such sub-requests inside a POST,
+		// which broke every POST whose code or re-rendered page calls requestAction (pdf_templates add, edit and add_cover call
+		// pdf_templates/jwtencode; QcDocuments and CustomTables pages call clean_table_names when a form is shown again). Such a
+		// request cannot come from outside: CakePHP sets 'requested' only in requestAction.
+		if ($this->request->is('requested')) return;
+		// M9 run s78 (13 Nov 2026): when an action fails with an error, CakePHP shows the error page through a second controller that
+		// runs this filter again on the same request, after the token was checked and removed from the data; that logged a false
+		// refused_csrf_token (and on a page it would turn the error page into the access-denied page). A request this guard has passed
+		// is not checked twice.
+		if (!empty($this->request->params['_m9_csrf_ok'])) return;
+		if (strtolower((string)$this->request->params['controller']) === 'users' && strtolower((string)$this->request->params['action']) === 'send_otp'
+			&& false === $this->request->is('post')) $this->_m9_ac_refuse('method_not_post', 'users/send_otp');
+		if (!$this->Session->read('User.id')) return;
+		$tk = (string)$this->Session->read('M9.tk');
+		if (preg_match('/^[0-9a-f]{64}$/', $tk) !== 1) { $tk = bin2hex(random_bytes(32)); $this->Session->write('M9.tk', $tk); }
+		$sent = (string)$this->request->header('X-M9-Token');
+		if (is_array($this->request->data) && array_key_exists('m9tk', $this->request->data)) {
+			if ($sent === '' && is_scalar($this->request->data['m9tk'])) $sent = (string)$this->request->data['m9tk'];
+			unset($this->request->data['m9tk']);
+		}
+		$a = strtolower((string)$this->request->params['action']); $c = strtolower((string)$this->request->params['controller']); $k = $c . '/' . $a;
+		// M9 review P2 (owner review 11 Nov 2026). Revision 4 chose these actions by name and accepted a GET with the token on some
+		// of them. Now the list comes from a sweep of every controller for actions that delete or remove data or files, or change
+		// approvals or access (s76): such an action accepts only POST (a form's PUT or DELETE included), never GET or HEAD, and
+		// always needs the token. The one exception is the confirmation page that FlinkISO shows on a GET to its own delete
+		// action (AppController::delete, QcDocuments::delete, CustomTables::delete); those three delete only on POST.
+		// M9 review Q1 (owner review 11 Nov 2026, second). Revision 5 asked for the token only on the actions it listed, so actions that
+		// change access rights or approvals by POST (users/reset_access, qc_documents/update_access, custom_tables/update_access and
+		// updateaccess, approval_comments/add_response, and every form that sends a record for approval) were accepted without it.
+		// Revision 6: (1) the actions listed here change data on any method or exist only to change data, access or approvals: they
+		// accept only POST (a form's PUT or DELETE included), never GET or HEAD; (2) every request that can change data (any method
+		// other than GET and HEAD) from a logged-in session needs the token, whatever the action. Exempt from (2) are only the steps
+		// that run before a login exists (the session has no token yet); OnlyOffice callbacks carry no session and are token-checked
+		// by _m9_onlyoffice_guard.
+		$named = array('approvals/action', 'custom_tables/process_sequence', 'custom_tables/reset_table_password', 'designations/update_parent',
+			'employees/update_parent', 'graph_panels/reset_display', 'pie_chart_panels/reset_display', 'users/copy_access_from',
+			'users/reset_access', 'users/add', 'qc_documents/update_access', 'custom_tables/update_access', 'custom_tables/updateaccess',
+			'approval_comments/add_response',
+			// M9 review R1 (owner review 12 Nov 2026, third): found by a sweep of every action for any write (model, query, file) reached
+			// without a method check. These exist only to change data, so they accept only POST. (A GET that slips past any list changes
+			// nothing either: AppModel refuses every model write during a GET or HEAD request.)
+			'custom_tables/recreate_all_forms', 'custom_tables/save_scripts', 'custom_tables/updatedataentry', 'employees/save_signature',
+			'records/add', 'files/initial_add', 'templates/initial_add');
+		$listed = in_array($a, array('bulk_delete', 'purge', 'upload_document', 'check_document'), true) || strpos($a, 'delete') === 0 || in_array($k, $named, true);
+		if ($listed && false === $this->request->is(array('post', 'put', 'delete'))) {
+			if ($a === 'delete' && $this->request->is(array('get', 'head')) && $this->_m9_delete_confirm_page($c)) return;
+			$this->_m9_ac_refuse('method_not_post', $k);
+		}
+		if ($this->request->is(array('get', 'head'))) return;
+		if ($c === 'users' && in_array($a, array('login', 'logout', 'opt_check', 'send_otp', 'register', 'activate', 'forgot_password', 'reset_password'), true)) return;
+		if ($sent === '' || false === hash_equals($tk, $sent)) $this->_m9_ac_refuse('csrf_token', $k);
+		$this->request->params['_m9_csrf_ok'] = 1;
+	}
+
+	// P2: does a GET to this controller's delete action only show FlinkISO's confirmation page? True for QcDocuments and
+	// CustomTables (their own delete deletes only inside is('post')) and for every controller that uses AppController::delete
+	// (it renders Elements/delete on a GET). False for a controller with its own delete (the generated chd_ controllers,
+	// approval_steps, graph_panels, pdf_templates), which deletes on any method.
+	public function _m9_delete_confirm_page($c) {
+		if ($c === 'qc_documents' || $c === 'custom_tables') return true;
+		try { $r = new ReflectionMethod($this, 'delete'); return $r->getDeclaringClass()->getName() === 'AppController'; } catch (Exception $m9e) { return false; }
+	}
+
+	// M9 review D-1 (owner review 10 Nov 2026): every request for a stored file under webroot/files (except samples/ and
+	// pdf_header.html) is sent here by files/.htaccess. Served only to: an administrator of the same company; another
+	// logged-in user of the same company under the rule of the folder's owner (_m9_file_rule, P1 11 Nov 2026), with, for a
+	// document's own file when its download setting is off, the right to edit it; files/pdf/<user>/... only to that user; or the OnlyOffice server with a
+	// valid token (Authorization: Bearer, HS256 with onlyofficesecret, naming this file; refused while the secret is empty,
+	// as for the callbacks). Anything else: HTTP 403 (404 for a path that is not a stored file), logged as file_refused.
+	public function m9_file() {
+		$this->autoRender = false;
+		$why = $this->_m9_file_check();
+		if (is_array($why)) {
+			$real = $why[0]; $ext = strtolower(pathinfo($real, PATHINFO_EXTENSION));
+			$inline = in_array($ext, array('pdf', 'png', 'jpg', 'jpeg', 'gif', 'txt'), true);
+			$this->response->header(array('X-Content-Type-Options' => 'nosniff', 'Cache-Control' => 'private, no-store'));
+			$this->response->file($real, $inline ? array() : array('download' => true, 'name' => basename($real)));
+			if ($ext === 'txt') $this->response->type('text/plain');
+			return $this->response;
+		}
+		$this->_m9_ac_log('file_refused', $why);
+		$this->response->statusCode($why === 'not_found' ? 404 : 403);
+		$this->response->header('X-Content-Type-Options', 'nosniff');
+		$this->response->type('text/plain');
+		$this->response->body($why === 'not_found' ? 'Not found' : 'Not authorized');
+		return $this->response;
+	}
+
+	// array(real path) when the request may have the file, otherwise the reason.
+	public function _m9_file_check() {
+		if ((string)$this->request->params['controller'] !== 'qc_documents') return 'not_found';
+		$f = isset($this->request->query['f']) ? $this->request->query['f'] : '';
+		if (false === is_string($f) || $f === '' || strlen($f) > 1000 || strpos($f, "\0") !== false || strpos($f, '\\') !== false) return 'not_found';
+		$parts = explode('/', trim($f, '/'));
+		foreach ($parts as $x) if ($x === '' || $x === '.' || $x === '..') return 'not_found';
+		$base = realpath(WWW_ROOT . 'files');
+		$real = $base === false ? false : realpath($base . DS . implode(DS, $parts));
+		if ($real === false || strpos($real, $base . DS) !== 0 || false === is_file($real)) return 'not_found';
+		if (count($parts) < 2 || $parts[0] === 'samples' || $parts[0] === 'pdf_header.html') return 'not_found';
+		if (substr($real, strlen($base) + 1) !== implode(DS, $parts)) return 'not_found'; // no link may lead elsewhere
+		$oo = $this->_m9_file_oo(implode('/', $parts));
+		if ($oo === '') return array($real);
+		$uid = (string)$this->Session->read('User.id');
+		if ($uid === '') return 'no_login' . ($oo !== 'no_token' ? ':' . $oo : '');
+		$admin = $this->Session->read('User.is_mr') == 1;
+		if ($parts[0] === 'pdf') return (isset($parts[1]) && $parts[1] === $uid) ? array($real) : 'pdf_other_user';
+		if ($parts[0] !== (string)$this->Session->read('User.company_id')) return 'other_company';
+		if ($admin) return array($real);
+		$why = $this->_m9_file_rule($parts); // M9 review P1 (owner review 11 Nov 2026): every folder has its owner's rule; any other folder is refused
+		return $why === '' ? array($real) : $why;
+	}
+
+	// M9 review P1 (owner review 11 Nov 2026). Revision 4 checked the document right only under files/<company>/qc_documents and
+	// served every other folder of the company (archive included) to any logged-in user of that company. Now, for a
+	// non-administrator, each folder applies the rule of the page that owns its files, and a folder with no rule is refused:
+	//   qc_documents/<document>/...           the document's view right; its own file with download off: its editors only
+	//   archive/<document>/<revision>/...     an archived copy: the view right on the archived document row of that revision
+	//                                         (the right view_archived checks), with the same download rule
+	//   files/<File id>/<name>                a file attached to a record: the rule of the record it belongs to (files row): for a
+	//                                         document, the document rule; otherwise the screen rule below and the record rule
+	//   custom_tables/<form>/...              a Custom Tables form's own files: a user named on the form (below)
+	//   record_files/<form>/<record>/...      a form record's files: named on the form, and the record rule (Q2)
+	//   templates, pdf_template(s), save_doc, backups, updates, users: administrators only, by name (Q2, 11 Nov 2026, second)
+	//   <screen>/<record>/...                 a screen's own folder: a user named on the form for a Custom Tables form, otherwise
+	//                                         the user's access setting for that screen's view page (as _check_access); and the
+	//                                         record rule (Q3): the record exists and the user may see it in the screen's list
+	// '' when permitted, otherwise the reason.
+	public function _m9_file_rule($parts) {
+		$top = $parts[1]; $n = count($parts);
+		if ($top === 'qc_documents') {
+			if ($n < 4 || false === $this->_isValidUuid($parts[2])) return 'not_permitted';
+			return $this->_m9_file_doc($parts[2], $n === 4);
+		}
+		if ($top === 'archive') {
+			if ($n < 5 || false === $this->_isValidUuid($parts[2])) return 'not_permitted';
+			$m = $this->_m9_model('QcDocument');
+			$rows = $m->find('all', array('recursive' => -1, 'fields' => array('QcDocument.id', 'QcDocument.revision_number'), 'conditions' => array('QcDocument.parent_id' => $parts[2], 'QcDocument.archived' => 1)));
+			$why = 'archive_no_record';
+			foreach ((array)$rows as $r) {
+				if (false === isset($r['QcDocument']['revision_number']) || (string)$r['QcDocument']['revision_number'] !== $parts[3]) continue;
+				$why = $this->_m9_file_doc((string)$r['QcDocument']['id'], true);
+				if ($why === 'download_off' && $this->_m9_doc_editor($parts[2])) $why = '';
+				if ($why === '') return '';
+			}
+			return $why;
+		}
+		if ($top === 'files') {
+			if ($n !== 4 || false === $this->_isValidUuid($parts[2])) return 'not_permitted';
+			$m = $this->_m9_model('File');
+			$f = $m->find('first', array('recursive' => -1, 'conditions' => array('File.id' => $parts[2])));
+			if (empty($f) || false === isset($f['File'])) return 'file_no_record';
+			$f = $f['File'];
+			$ctl = isset($f['controller']) ? (string)$f['controller'] : '';
+			$rid = isset($f['record_id']) ? (string)$f['record_id'] : '';
+			if ($ctl === 'qc_documents' || (isset($f['model']) && (string)$f['model'] === 'QcDocument')) {
+				if (false === $this->_isValidUuid($rid) && isset($f['qc_document_id'])) $rid = (string)$f['qc_document_id'];
+				return $this->_isValidUuid($rid) ? $this->_m9_file_doc($rid, true) : 'not_permitted';
+			}
+			$why = $this->_m9_file_screen($ctl, isset($f['custom_table_id']) ? (string)$f['custom_table_id'] : '');
+			return $why === '' ? $this->_m9_record_visible($ctl, $rid) : $why; // Q3: and the record the file belongs to
+		}
+		if ($top === 'custom_tables') return ($n >= 4 && $this->_isValidUuid($parts[2])) ? $this->_m9_file_screen('custom_tables', $parts[2]) : 'not_permitted'; // a form's own files
+		if ($top === 'record_files') { // Q2: record_files/<form>/<record>/... (AppController add and edit of a form record)
+			if ($n < 5 || false === $this->_isValidUuid($parts[2]) || false === $this->_isValidUuid($parts[3])) return 'not_permitted';
+			$why = $this->_m9_file_screen('custom_tables', $parts[2]);
+			if ($why !== '') return $why;
+			$t = $this->_m9_model('CustomTable')->find('first', array('recursive' => -1, 'fields' => array('CustomTable.id', 'CustomTable.table_name'), 'conditions' => array('CustomTable.id' => $parts[2])));
+			$tn = (empty($t) || false === isset($t['CustomTable']['table_name'])) ? '' : (string)$t['CustomTable']['table_name'];
+			return preg_match('/^(tbl|chd)_[a-z0-9_]+$/', $tn) === 1 ? $this->_m9_record_visible($tn, $parts[3]) : 'form_no_record';
+		}
+		// Q2: folders of pages that are for administrators only, or of system files, are refused by name, whatever the access list says
+		if (in_array($top, array('templates', 'pdf_template', 'pdf_templates', 'save_doc', 'backups', 'updates', 'users'), true)) return 'admin_only';
+		if ($n >= 4 && preg_match('/^[a-z][a-z0-9_]*$/', $top) === 1 && $this->_isValidUuid($parts[2])) {
+			$why = $this->_m9_file_screen($top, '');
+			return $why === '' ? $this->_m9_record_visible($top, $parts[2]) : $why; // Q3: and the record named by the folder
+		}
+		return 'not_permitted';
+	}
+
+	// M9 review Q3 (owner review 11 Nov 2026, second): may this non-administrator see record $rid of screen $ctl? The same
+	// conditions as FlinkISO's list of that screen (_check_request), without the published filter (unpublished records are listed
+	// under published:0): the record exists and is not deleted; outside qc_documents, custom_tables and standards, its branch is one
+	// of the user's assigned branches; without "view all", the user prepared, approved, created or last modified it. FlinkISO's
+	// department rule for heads of department reads User.hod, which login never sets, so it is inactive in FlinkISO and here alike.
+	// '' when permitted, otherwise the reason.
+	public function _m9_record_visible($ctl, $rid) {
+		$ctl = (string)$ctl; $rid = (string)$rid;
+		if (preg_match('/^[a-z][a-z0-9_]*$/', $ctl) !== 1 || false === $this->_isValidUuid($rid)) return 'record_not_permitted';
+		$mn = Inflector::classify($ctl);
+		try { $M = $this->_m9_model($mn); $r = $M->find('first', array('recursive' => -1, 'conditions' => array($mn . '.id' => $rid))); } catch (Exception $m9e) { return 'record_no_model'; }
+		if (empty($r) || false === isset($r[$mn]) || false === is_array($r[$mn])) return 'record_missing';
+		$r = $r[$mn];
+		if (isset($r['soft_delete']) && (int)$r['soft_delete'] === 1) return 'record_deleted';
+		$uid = (string)$this->Session->read('User.id'); $eid = (string)$this->Session->read('User.employee_id');
+		$dep = (string)$this->Session->read('User.department_id'); $hod = false;
+		if ((int)$this->Session->read('User.hod') === 1 && $dep !== '' && isset($M->belongsTo) && is_array($M->belongsTo)) {
+			foreach ($M->belongsTo as $b) if (is_array($b) && isset($b['className'], $b['foreignKey']) && $b['className'] === 'Department' && isset($r[$b['foreignKey']]) && strpos((string)$r[$b['foreignKey']], $dep) !== false) $hod = true;
+		}
+		if (false === in_array($ctl, array('qc_documents', 'custom_tables', 'standards'), true) && array_key_exists('branchid', $r) && false === $hod) {
+			$br = json_decode((string)$this->Session->read('User.assigned_branches'), true);
+			$br = is_array($br) ? array_map('strval', array_filter($br, 'is_scalar')) : array();
+			if (false === in_array((string)$r['branchid'], $br, true)) return 'record_other_branch';
+		}
+		if ((int)$this->Session->read('User.is_view_all') !== 1 && false === $hod) {
+			$own = false;
+			foreach (array('prepared_by' => $eid, 'approved_by' => $eid, 'created_by' => $uid, 'modified_by' => $uid) as $col => $me) if ($me !== '' && isset($r[$col]) && (string)$r[$col] === $me) $own = true;
+			if (false === $own) return 'record_not_own';
+		}
+		return '';
+	}
+
+	// P1: a document's file. $own: the document's own file or a copy of it, to which the download setting applies.
+	public function _m9_file_doc($id, $own) {
+		if (false === $this->_m9_can_view_document($id)) return 'not_permitted';
+		if ($own) {
+			$m = $this->_m9_model('QcDocument');
+			$d = $m->find('first', array('recursive' => -1, 'fields' => array('QcDocument.allow_download'), 'conditions' => array('QcDocument.id' => $id)));
+			if ((empty($d) || (int)$d['QcDocument']['allow_download'] !== 1) && false === $this->_m9_doc_editor($id)) return 'download_off';
+		}
+		return '';
+	}
+
+	// P1: a screen's file. A Custom Tables form: a user named on one of the form's lists (viewers, editors, creators, approvers:
+	// the lists _customtableacces checks for its pages; a child form with no lists of its own uses its parent's). Any other screen: the view setting in the
+	// user's access list (as _check_access); a screen not in the list is refused.
+	public function _m9_file_screen($ctl, $ctid) {
+		if ($ctl === '' || preg_match('/^[a-z][a-z0-9_]*$/', $ctl) !== 1) return 'not_permitted';
+		$uid = (string)$this->Session->read('User.id');
+		$ct = $this->_m9_model('CustomTable');
+		$t = array();
+		if ($this->_isValidUuid($ctid)) $t = $ct->find('first', array('recursive' => -1, 'conditions' => array('CustomTable.id' => $ctid)));
+		elseif (strpos($ctl, 'tbl_') === 0 || strpos($ctl, 'chd_') === 0) $t = $ct->find('first', array('recursive' => -1, 'conditions' => array('CustomTable.table_name' => array($ctl, Inflector::singularize($ctl)))));
+		if (strpos($ctl, 'tbl_') === 0 || strpos($ctl, 'chd_') === 0 || $this->_isValidUuid($ctid)) {
+			if (empty($t) || false === isset($t['CustomTable'])) return 'form_no_record';
+			$v = $this->_m9_form_users($t['CustomTable']);
+			if ($v === array() && isset($t['CustomTable']['custom_table_id']) && $this->_isValidUuid((string)$t['CustomTable']['custom_table_id'])) {
+				$p = $ct->find('first', array('recursive' => -1, 'conditions' => array('CustomTable.id' => (string)$t['CustomTable']['custom_table_id'])));
+				if (false === empty($p) && isset($p['CustomTable'])) $v = $this->_m9_form_users($p['CustomTable']);
+			}
+			return in_array($uid, $v, true) ? '' : 'form_not_named';
+		}
+		$um = $this->_m9_model('User');
+		$u = $um->find('first', array('recursive' => -1, 'fields' => array('User.id', 'User.user_access'), 'conditions' => array('User.id' => $uid)));
+		$a = json_decode(empty($u) ? '' : (string)$u['User']['user_access'], true);
+		$a = (is_array($a) && isset($a['user_access']) && is_array($a['user_access'])) ? $a['user_access'] : array();
+		return (isset($a[$ctl]) && is_array($a[$ctl]) && isset($a[$ctl]['view']) && (int)$a[$ctl]['view'] === 1) ? '' : 'screen_not_permitted';
+	}
+
+	// P1: every user id on a form's viewers, editors, creators and approvers lists (JSON arrays), as text.
+	public function _m9_form_users($row) {
+		$v = array();
+		foreach (array('viewers', 'editors', 'creators', 'approvers') as $k) {
+			$x = isset($row[$k]) ? json_decode((string)$row[$k], true) : null;
+			if (is_array($x)) foreach ($x as $y) if (is_scalar($y) && (string)$y !== '') $v[] = (string)$y;
+		}
+		return $v;
+	}
+
+	// P1: a model by name, loaded the way FlinkISO loads its models.
+	public function _m9_model($name) {
+		if (false === isset($this->$name) || false === is_object($this->$name)) $this->loadModel($name);
+		return $this->$name;
+	}
+
+	// '' when the request carries a valid OnlyOffice token for files/$rel; otherwise the reason.
+	public function _m9_file_oo($rel) {
+		$hdr = (string)$this->request->header('Authorization');
+		if (stripos($hdr, 'Bearer ') !== 0) return 'no_token';
+		$secret = (string)Configure::read('onlyofficesecret');
+		if ($secret === '') return 'no_secret';
+		$pl = $this->_m9_jwt_valid(trim(substr($hdr, 7)), $secret);
+		if (!is_array($pl)) return 'bad_token';
+		if (!isset($pl['exp']) || !is_numeric($pl['exp']) || (int)$pl['exp'] < time() || (int)$pl['exp'] > time() + 3600) return 'bad_exp';
+		$c = (isset($pl['payload']) && is_array($pl['payload'])) ? $pl['payload'] : $pl;
+		$u = (isset($c['url']) && is_string($c['url'])) ? @parse_url($c['url'], PHP_URL_PATH) : null;
+		if (false === is_string($u) || rawurldecode($u) !== '/files/' . $rel) return 'token_other_file';
+		return '';
+	}
+
+	public function _m9_addl_path($p, $atRoot) {
+		$base = realpath((string)Configure::read('path'));
+		if ($base === false || false === is_string($p) || $p === '' || strpos($p, "\0") !== false) return false;
+		$pre = rtrim((string)Configure::read('path'), DS) . DS;
+		if (strpos($p, $pre) !== 0) return false;
+		$parts = explode(DS, rtrim(substr($p, strlen($pre)), DS));
+		foreach ($parts as $x) if ($x === '' || $x === '.' || $x === '..') return false;
+		if (count($parts) < 2 || false === $this->_isValidUuid($parts[0]) || $parts[1] !== 'addtional_documents') return false;
+		if (false === $atRoot && count($parts) < 3) return false;
+		$real = realpath($p);
+		$root = $base . DS . $parts[0] . DS . 'addtional_documents';
+		if ($real === false) return false;
+		if ($real === $root) return $atRoot ? $real : false;
+		return (strpos($real, $root . DS) === 0) ? $real : false;
+	}
+
+	// M9 review V5: the record named by an upload exists in this controller's model.
+	public function _m9_record_exists($rid) {
+		try {
+			$m = $this->modelClass;
+			if (false === isset($this->$m)) $this->loadModel($m);
+			return (bool)$this->$m->exists($rid);
+		} catch (Exception $m9e) { return false; }
+	}
+
+	// Decision 333 (10 Nov 2026): FlinkISO never refuses a logged-in user on qc_documents, custom_tables, standards or clauses
+	// (_access_redirect), so these three actions were open to every user on any record. A non-administrator may now use them
+	// only on qc_documents (the only page that shows the upload area) and only for a document they may view (M9 correction 4).
+	public function _m9_addl_allowed($rid) {
+		if ($this->Session->read('User.is_mr') == 1) return true;
+		if ((string)$this->request->params['controller'] !== 'qc_documents') return false;
+		if (false === is_string($rid) || false === $this->_isValidUuid($rid)) return false;
+		return (bool)$this->_m9_doc_editor($rid); // M9 review O3, decision 341: the edit right, not the view right
+	}
+
+	// Decision 333: the record id of a path already contained by _m9_addl_path (path/<record>/addtional_documents/...).
+	public function _m9_addl_record($real) {
+		$base = realpath((string)Configure::read('path'));
+		if ($base === false || false === is_string($real) || strpos($real, $base . DS) !== 0) return '';
+		$p = explode(DS, substr($real, strlen($base) + 1));
+		return (string)$p[0];
+	}
+
+	// M9 review V1: the pdftk program, quoted (the setting carries a trailing space).
+	public function _m9_pdftk() {
+		return escapeshellarg(trim((string)Configure::read('PDFTkPath')));
+	}
+
+	// M9 review (10 Nov 2026): methods that are helpers, not pages. CakePHP 2 makes every public controller method a URL
+	// action; these are refused when called by address (an internal requestAction is still allowed). add_password runs pdftk
+	// (V1); generateJWT and base64_url_encode sign or encode with the OnlyOffice secret; listFolderFiles reads folders.
+	public function _m9_internal_guard() {
+		$a = strtolower((string)$this->request->params['action']);
+		if (in_array($a, array('add_password', 'generatejwt', 'base64_url_encode', 'listfolderfiles'), true) && false === $this->request->is('requested')) $this->_m9_ac_refuse('internal_action', $a);
+		// M9 review, s76 sweep (11 Nov 2026). Refused by address for every user:
+		//   qc_documents/fix_names  rewrites the name and title of every document on a GET; any logged-in user could reach it
+		//   billing/backup, downloading_update, updating_sql, copy_files  FlinkISO's self-updater: on a GET it downloads the
+		//     vendor's main branch, runs its SQL line by line and copies it over app/ and lib/, which would remove every
+		//     correction in this package. Kept refused unless the owner decides otherwise in writing.
+		$k = strtolower((string)$this->request->params['controller']) . '/' . $a;
+		//   clauses/csv (R1, 12 Nov 2026)  adds a fixed list of clause rows on every GET; clauses is outside the vendor access check,
+		//     so any logged-in user could run it. A set-up helper with no link in the application.
+		if (in_array($k, array('qc_documents/fix_names', 'billing/backup', 'billing/downloading_update', 'billing/updating_sql', 'billing/copy_files', 'clauses/csv'), true) && false === $this->request->is('requested')) $this->_m9_ac_refuse('blocked_action', $k);
+		// M9 review R3 (12 Nov 2026): custom_files/download_file and delete_file take a path from the form (base64) and send or
+		// delete that file after the user's password. The path must now be a stored file inside the user's own company folder.
+		if (($k === 'custom_files/download_file' || $k === 'custom_files/delete_file') && $this->request->is(array('post', 'put'))) {
+			$m9d = $this->request->data;
+			$m9p = (is_array($m9d) && isset($m9d['CustomFile']) && is_array($m9d['CustomFile']) && isset($m9d['CustomFile']['file']) && is_string($m9d['CustomFile']['file'])) ? base64_decode($m9d['CustomFile']['file'], true) : false;
+			if (false === $this->_m9_company_file($m9p)) $this->_m9_ac_refuse('file_outside_company', $k);
+		}
+		// json, xml and return_user_list are on FlinkISO's list of actions served without login; the generated form controllers
+		// list their records through json and xml, and return_user_list lists users. They now need a login like any page.
+		if (in_array($a, array('json', 'xml', 'return_user_list'), true) && false === (bool)$this->Session->read('User.id')) $this->_m9_ac_refuse('login_required', $k);
+	}
+
+	// Owner's fourth review (13 Nov 2026). Three actions that no page of the application calls are refused for every user,
+	// administrators included, on any method. The check runs last in beforeFilter, so the login, token, administrator and access
+	// checks answer first, exactly as before; only a request that would have reached the action is stopped here.
+	//   approvals/action  the script that would call it (approve() in approval_history.ctp) is never called. For an approval of
+	//     type 0 it saved the approval and then stopped with a fatal error, the record not published; for other types it published
+	//     the record without recording a response or moving the approval step. Approvals are answered through
+	//     approval_comments/add_response.
+	//   custom_tables/update_field, update_child_field  both saved the form definition before changing the table and built the
+	//     table change from posted text; update_child_field then stopped on components that are not declared and are empty, so the
+	//     definition and the table no longer matched. Fields are changed through recreate and recreate_child.
+	public function _m9_retired_guard() {
+		$k = strtolower((string)$this->request->params['controller']) . '/' . strtolower((string)$this->request->params['action']);
+		if (in_array($k, array('approvals/action', 'custom_tables/update_field', 'custom_tables/update_child_field'), true)) $this->_m9_ac_refuse('blocked_action', $k);
+	}
+
+	// Owner's fourth review (13 Nov 2026): UsersController::register calls $this->insert_sample_data() when the "sample data"
+	// box is ticked on a first installation, and FlinkISO defines it nowhere, so that request stopped with a fatal error after the
+	// account was created. It now records that sample data is not available and returns. Protected: CakePHP never runs a
+	// non-public method from an address, so this adds no page. register() itself redirects whenever any user exists.
+	protected function insert_sample_data() {
+		$this->_m9_ac_log('sample_data_not_available', 'users/register');
+		return false;
+	}
+
+	// R3: true only for an existing file that, after resolving links and '..', lies inside webroot/files/<the user's company>/.
+	public function _m9_company_file($path) {
+		$co = (string)$this->Session->read('User.company_id');
+		if (false === is_string($path) || $path === '' || strpos($path, "\0") !== false || preg_match('/^[A-Za-z0-9_-]+$/', $co) !== 1) return false;
+		$base = realpath(WWW_ROOT . 'files' . DS . $co); $real = realpath($path);
+		return $base !== false && $real !== false && is_file($real) && strpos($real, $base . DS) === 0;
+	}
+
+	// M9 review R2 (owner review 12 Nov 2026): the Custom Tables designer. custom_tables is outside the vendor access check and
+	// several of its actions had no administrator check of their own; those are now administrator-only in _m9_access_guard. This
+	// guard applies to everyone, administrators included: the ids a request carries must belong together.
+	//   updatedataentry/<document>/<form>  the form exists, the document is that form's own document, and the user created the
+	//                                      form (the rule of the designer page, custom_tables/view, which holds this form)
+	//   save_scripts                       the posted form exists and the user created it (same page)
+	//   link_processes/<form>              on POST: the form exists and every posted process exists (-1 = none)
+	//   delete_link_processes/<form>/<p>, process_sequence/id:<form>, updateaccess/<form>: the form exists
+	//   lock, unlock, publish, hold        a posted form id must be the one in the address when both are given
+	// Refusals are logged with the reason. Nothing is read from or written to the form before these checks pass.
+	public function _m9_designer_guard() {
+		if (strtolower((string)$this->request->params['controller']) !== 'custom_tables') return;
+		$a = strtolower((string)$this->request->params['action']);
+		if (false === in_array($a, array('updatedataentry', 'save_scripts', 'link_processes', 'delete_link_processes', 'process_sequence', 'updateaccess', 'lock', 'unlock', 'publish', 'hold'), true)) return;
+		if (false === $this->request->is(array('post', 'put', 'delete'))) return;
+		$pass = (isset($this->request->params['pass']) && is_array($this->request->params['pass'])) ? array_values($this->request->params['pass']) : array();
+		$named = (isset($this->request->params['named']) && is_array($this->request->params['named'])) ? $this->request->params['named'] : array();
+		$d = is_array($this->request->data) ? $this->request->data : array();
+		$s = function ($v) { return (is_scalar($v) && false === is_bool($v)) ? (string)$v : ''; };
+		$posted = (isset($d['CustomTable']) && is_array($d['CustomTable']) && isset($d['CustomTable']['id'])) ? $s($d['CustomTable']['id']) : '';
+		$form = function ($id) {
+			if ($id === '') return null;
+			$f = ClassRegistry::init('CustomTable')->find('first', array('recursive' => -1, 'fields' => array('CustomTable.id', 'CustomTable.qc_document_id', 'CustomTable.created_by'), 'conditions' => array('CustomTable.id' => $id)));
+			return empty($f['CustomTable']) ? null : $f['CustomTable'];
+		};
+		$uid = (string)$this->Session->read('User.id');
+		if ($a === 'updatedataentry') {
+			$doc = isset($pass[0]) ? $s($pass[0]) : ''; $f = $form(isset($pass[1]) ? $s($pass[1]) : '');
+			if ($f === null) $this->_m9_ac_refuse('form_unknown', substr(isset($pass[1]) ? $s($pass[1]) : '', 0, 8));
+			if ($doc === '' || (string)$f['qc_document_id'] !== $doc) $this->_m9_ac_refuse('document_not_of_form', substr($doc, 0, 8));
+			if ($uid === '' || (string)$f['created_by'] !== $uid) $this->_m9_ac_refuse('not_form_owner', substr((string)$f['id'], 0, 8));
+			return;
+		}
+		if ($a === 'save_scripts') {
+			$f = $form($posted);
+			if ($f === null) $this->_m9_ac_refuse('form_unknown', substr($posted, 0, 8));
+			if ($uid === '' || (string)$f['created_by'] !== $uid) $this->_m9_ac_refuse('not_form_owner', substr((string)$f['id'], 0, 8));
+			return;
+		}
+		if (in_array($a, array('lock', 'unlock', 'publish', 'hold'), true)) {
+			$p0 = isset($pass[0]) ? $s($pass[0]) : '';
+			if ($p0 !== '' && $posted !== '' && $p0 !== $posted) $this->_m9_ac_refuse('record_id_mismatch', 'CustomTable.id:' . substr($posted, 0, 8));
+			return;
+		}
+		$id = ($a === 'process_sequence') ? (isset($named['id']) ? $s($named['id']) : '') : (isset($pass[0]) ? $s($pass[0]) : '');
+		if ($form($id) === null) $this->_m9_ac_refuse('form_unknown', substr($id, 0, 8));
+		if ($a === 'link_processes') {
+			// the page posts JSON; CakePHP fills request->data from it only after this filter, so the body is read here
+			$str = isset($d['str']) ? $d['str'] : null;
+			if ($str === null) { $j = json_decode((string)$this->request->input(), true); if (is_array($j) && array_key_exists('str', $j)) $str = $j['str']; }
+			if ($str === null || $str === '') return; // the action itself answers "error" and changes nothing
+			if (false === is_array($str)) $this->_m9_ac_refuse('process_unknown', 'not a list');
+			$ids = array();
+			foreach ($str as $p) { $p = $s($p); if ($p === '') $this->_m9_ac_refuse('process_unknown', 'empty'); if ($p !== '-1') $ids[$p] = true; }
+			if ($ids && (int)ClassRegistry::init('Process')->find('count', array('recursive' => -1, 'conditions' => array('Process.id' => array_keys($ids)))) !== count($ids)) $this->_m9_ac_refuse('process_unknown', substr(implode(',', array_keys($ids)), 0, 40));
+		}
+	}
+
+	// M9 review V8 (10 Nov 2026): FlinkISO stores uploaded files under the web root with an extension taken from the request:
+	// QcDocuments add (_step1) and upload_qc_document use the posted QcDocument.file_type, Processes keeps the client's file
+	// name, Templates the client's extension. The stored file_type is reused later for every file the record writes. So any
+	// extension, .php included, could be stored. Now, for every user and every action: an uploaded file whose name starts with
+	// a dot or carries a script extension anywhere in it is refused (the V5 rule), and a posted QcDocument.file_type or
+	// Process.file_type must be an office, PDF or text type. Refusals are logged.
+	public function _m9_upload_guard() {
+		if (false === $this->request->is(array('post', 'put')) || false === is_array($this->request->data)) return;
+		$bad = '/\.(php[0-9]?|phtml|phar|pht|phps|cgi|pl|py|sh|bash|shtml|asp|aspx|jsp|htaccess|htpasswd|ini|user\.ini)(\.|$)/i';
+		$walk = function ($a) use (&$walk, $bad) {
+			foreach ($a as $v) {
+				if (false === is_array($v)) continue;
+				if (array_key_exists('tmp_name', $v) && array_key_exists('name', $v)) {
+					foreach ((array)$v['name'] as $n) {
+						if (false === is_scalar($n)) return true;
+						$n = (string)$n;
+						if ($n !== '' && ($n[0] === '.' || preg_match($bad, $n) === 1)) return true;
+						// M9 review O1 (owner review 10 Nov 2026): and only office, PDF, text and picture types (no HTML, SVG or script)
+						if ($n !== '' && preg_match('/\.(doc|docx|xls|xlsx|ppt|pptx|odt|ods|odp|rtf|txt|pdf|csv|png|jpg|jpeg|gif)$/i', $n) !== 1) return true;
+					}
+				} elseif ($walk($v)) return true;
+			}
+			return false;
+		};
+		if ($walk($this->request->data)) $this->_m9_ac_refuse('upload_type', 'name');
+		foreach (array('QcDocument', 'Process') as $m) {
+			if (false === isset($this->request->data[$m]) || false === is_array($this->request->data[$m]) || false === array_key_exists('file_type', $this->request->data[$m])) continue;
+			$t = $this->request->data[$m]['file_type'];
+			if ($t === null || $t === '') continue;
+			if (false === is_scalar($t) || false === in_array(strtolower((string)$t), array('doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'odt', 'ods', 'odp', 'rtf', 'txt', 'pdf', 'csv'), true)) $this->_m9_ac_refuse('doc_type', $m);
 		}
 	}
 
@@ -2051,7 +2789,7 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 					$this->loadModel('File');
 					$user = $this->User->find('first', array('conditions' => array('User.status' => 1, 'User.soft_delete' => 0, 'User.publish' => 1, 'User.username' => $this->Session->read('User.username'))));
 					if($user){
-						if (trim($user['User']['password']) != trim(Security::hash($this->data[$model]['password'], 'md5', true))) {
+						if (!$this->_m9_password_matches($user['User']['password'], $this->data[$model]['password'], $user['User']['id'])) {
 							// incorrect password
 							$this->Session->setFlash(__('Incorrect Password'));
 							$this->loadModel($model);
@@ -2203,8 +2941,8 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 			$file_for_save = $path_for_save . DS . $local['File']['name'] . '.' . $local['File']['file_type'];			
 			$testfolder = new Folder($path_for_save);
 			$testfolder->create($path_for_save);
-			chmod($path_for_save, 0777);
-			chmod($file_for_save, 0777);
+			$this->_m9_mode($path_for_save);
+			$this->_m9_mode($file_for_save);
 			$downloadUri = $data["url"];
 			if (file_get_contents($downloadUri) === FALSE) {
 				
@@ -3136,8 +3874,8 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 					$file_for_save = $path_for_save . DS . $fileName;
 					$testfolder = new Folder($path_for_save);
 					$testfolder->create($path_for_save);
-					chmod($path_for_save, 0777);
-					chmod($file_for_save, 0777);
+					$this->_m9_mode($path_for_save);
+					$this->_m9_mode($file_for_save);
 					$downloadUri = $data["url"];					
 					if (file_get_contents($downloadUri) === FALSE) {
 
@@ -3172,7 +3910,7 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 							$history_file_for_save = $path_for_save . DS .$fileName.'-hist' . DS . $version;
 							$historyFolder = new Folder($history_file_for_save);
 							$historyFolder->create($history_file_for_save);
-							chmod($history_file_for_save, 0777);
+							$this->_m9_mode($history_file_for_save);
 							file_put_contents($history_file_for_save . DS . "createdInfo.json", json_encode($json, JSON_PRETTY_PRINT));
 						} else {
 						}
@@ -3195,9 +3933,9 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 					$history_file_for_save = $path_for_save . DS .$fileName.'-hist' . DS . $version;
 					$historyFolder = new Folder($history_file_for_save);
 					$historyFolder->create($history_file_for_save);
-					chmod($path_for_save, 0777);
-					chmod($file_for_save, 0777);
-					chmod($history_file_for_save, 0777);
+					$this->_m9_mode($path_for_save);
+					$this->_m9_mode($file_for_save);
+					$this->_m9_mode($history_file_for_save);
 					$downloadUri = $data["url"];
 					// update_version if(version to be updated of not);
 					// if($qcdoc['QcDocument']['update_version'] == 1){
@@ -3291,8 +4029,8 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 				$file_for_save = $path_for_save . DS . $fileName;
 				$testfolder = new Folder($path_for_save);
 				$testfolder->create($path_for_save);
-				chmod($path_for_save, 0777);
-				chmod($file_for_save, 0777);
+				$this->_m9_mode($path_for_save);
+				$this->_m9_mode($file_for_save);
 				$downloadUri = $data["url"];
 				if (file_get_contents($downloadUri) === FALSE) {					
 				} else {
@@ -3333,8 +4071,8 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 			$file_for_save = $path_for_save . DS . $fileName;
 			$testfolder = new Folder($path_for_save);
 			$testfolder->create($path_for_save);
-			chmod($path_for_save, 0777);
-			chmod($file_for_save, 0777);
+			$this->_m9_mode($path_for_save);
+			$this->_m9_mode($file_for_save);
 			$downloadUri = $data["url"];
 			if (file_get_contents($downloadUri) === FALSE) {
 			} else {
@@ -3662,7 +4400,7 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 							if(file_exists($toFile))unlink($toFile);
 							
 							$folder = new Folder(); 
-							$dir = new Folder(Configure::read('files') . DS . 'files' . DS . $this->File->id, true, 0777);
+							$dir = new Folder(Configure::read('files') . DS . 'files' . DS . $this->File->id, true, 0755);
 
 							if (copy($fromFile, $toFile)) {
 								$data['File']['id'] = $this->File->id;
@@ -3972,7 +4710,7 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 							$this->$model->save($cdata,false);
 							$path = WWW_ROOT . 'files' . DS . $this->Session->read('User.company_id') . DS . 'record_files' . DS . $cdata['custom_table_id'] . DS . $this->$model->id ;
 							$recordfilesfolder = new Folder($path);
-							$recordfilesfolder->create($path,0777);
+							$recordfilesfolder->create($path,0755);
 							$move = move_uploaded_file($file['tmp_name'], $path . DS . $file['name']);
 						}catch(Exception $e) {
 					 		$this->Session->setFlash(__('Child record not added/ Updated.'), 'default', array('class' => 'alert alert-danger'));
@@ -3981,8 +4719,8 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 				}
 			}
 			
-			if ($this->_show_approvals()) $this->_save_approvals($this->$modelName->id);
-			$this->Session->setFlash(__('Record has been saved'));
+			$m9ap = $this->_show_approvals() ? $this->_save_approvals($this->$modelName->id) : true; // M9 correction 29: the result is reported
+			$this->Session->setFlash($m9ap ? __('Record has been saved') : __('Record has been saved, but the approval request could not be sent.'));
 			try{
 				// trigger email here
 				$this->_trigger_email($existingRecord); 
@@ -4008,7 +4746,7 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 				if($parent_document){
 					foreach($parent_document['CustomTable'] as $cTable){
 						$this->CustomTable->virtualFields = array(
-							'rec'=>'select count(*) from `'.$cTable['table_name'].'` where id LIKE "'.$this->request->params['named']['parent_record_id'].'" ');
+							'rec'=>'select count(*) from `'.$cTable['table_name'].'` where id = '.$this->CustomTable->getDataSource()->value((string)$this->request->params['named']['parent_record_id'], 'string')); // M9 review V2: quoted by the database layer
 						$parent_rec = $this->CustomTable->find('first',array(						
 							'conditions'=>array('CustomTable.qc_document_id'=>$parent_document['QcDocument']['id'],'CustomTable.rec >'=>0),'recursive'=>-1));
 						if($parent_rec){
@@ -4037,7 +4775,7 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 			$path = WWW_ROOT . 'files' . DS . $this->Session->read('User.company_id') . DS . 'record_files' . DS . $custom_table_id . DS . $id ;
 			$recordfilesfolder = new Folder($path_for_save);
 			$recordfilesfolder->create($path);
-			chmod($path, 0777);
+			$this->_m9_mode($path);
 			foreach($files as $file){
 				$result = move_uploaded_file($file['tmp_name'], $path . DS . $file['name']); 
 				if($result == false){
@@ -4579,7 +5317,7 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 											$docsave = $path . DS . $newFile['File']['id'] . DS . $file['File']['name'].'.'.$file['File']['file_type'];
 											if(!file_exists($docsave)){
 												$newFolder = new Folder();
-												$newFolder->create(WWW_ROOT . DS . 'files' . DS . $this->Session->read('User.company_id') . DS . 'files' . DS . $this->File->id,0777);
+												$newFolder->create(WWW_ROOT . DS . 'files' . DS . $this->Session->read('User.company_id') . DS . 'files' . DS . $this->File->id,0755);
 												copy($doc,$docsave);
 											}
 										}								
@@ -4661,7 +5399,7 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 									$docsave = WWW_ROOT . DS . 'files' . DS . $this->Session->read('User.company_id') . DS . 'files' . DS . $this->File->id . DS . $file['File']['name'].'.'.$file['File']['file_type'];
 									if(!file_exists($docsave)){
 										$newFolder = new Folder();
-										$newFolder->create(WWW_ROOT . DS . 'files' . DS . $this->Session->read('User.company_id') . DS . 'files' . DS . $this->File->id,0777);
+										$newFolder->create(WWW_ROOT . DS . 'files' . DS . $this->Session->read('User.company_id') . DS . 'files' . DS . $this->File->id,0755);
 										copy($doc,$docsave);	
 									}
 								}
@@ -4696,7 +5434,7 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 				$this->loadModel('User');
 				$user = $this->User->find('first', array('conditions' => array('User.status' => 1, 'User.soft_delete' => 0, 'User.publish' => 1, 'User.username' => $this->Session->read('User.username'))));
 				if ($user) {
-					if (trim($user['User']['password']) != trim(Security::hash($this->request->data[Inflector::classify($this->request->controller)]['password'], 'md5', true))) {
+					if (!$this->_m9_password_matches($user['User']['password'], $this->request->data[Inflector::classify($this->request->controller)]['password'], $user['User']['id'])) {
 						$this->Session->setFlash(__('Incorrect password', true), 'default', array('class' => 'alert-danger'));
 					} else {
 						$getid = explode('/', (string)base64_decode((string)$this->request->data[Inflector::classify($this->request->controller)]['url']));
@@ -4999,14 +5737,16 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 		$response_data = file_get_contents($path, FALSE, $context);
 		$downloadUri = json_decode($response_data,true);
 		$downloadUri = $downloadUri['fileUrl'];
-		if (file_get_contents($downloadUri) === FALSE) {
+		// M9 run s78 (13 Nov 2026): with no file address from the document server, PHP 8 stopped the request at file_get_contents(null)
+		// ("Path cannot be empty") instead of showing FlinkISO's own conversion error. The address is checked first.
+		if (false === is_string($downloadUri) || $downloadUri === '' || file_get_contents($downloadUri) === FALSE) {
 			Echo "Error in file conversion";
 			exit;		
 		} else {	
 			$savepath = WWW_ROOT .'files' . DS . 'pdf' . DS . $this->Session->read('User.id') . DS . $record_id;
 			if(!file_exists($savepath)){
 				$folder = new Folder();
-				if ($folder->create($savepath,0777)) {
+				if ($folder->create($savepath,0755)) {
 				} else {
 					echo "Folder creation failed";
 					exit;
@@ -5076,7 +5816,7 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 		if(file_exists($cover)){
 			$input = $pdf;
 			$newoutput = str_replace('-remove-pdf-', '-add-cover-', $pdf);
-			$exec = Configure::read('PDFTkPath') . ' A=' .$cover .' B=' .$input.  ' cat A B output '. $newoutput .'';
+			$exec = $this->_m9_pdftk() . ' A=' . escapeshellarg($cover) . ' B=' . escapeshellarg($input) . ' cat A B output ' . escapeshellarg($newoutput); // M9 review V1: arguments quoted
 			exec($exec);
 			$input = $pdf;
 			$output = str_replace('-add-cover-', '', $newoutput);
@@ -5084,9 +5824,9 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 			$sign = $this->_sign_to_pdf($this->request->data['DocumentDownload']['signature'],$record_id,$this->request->data['DocumentDownload']['font_face'],$this->request->data['DocumentDownload']['font_size']);
 			if($password && $password != ''){
 				$ownerpass = $password . '-owner';
-				$exec = Configure::read('PDFTkPath') . ' ' .$newoutput .' multistamp ' .$sign.  ' output '. $output . ' user_pw '. $password .' owner_pw '.$ownerpass.' ' . $allowcommand;
+				$exec = $this->_m9_pdftk() . ' ' . escapeshellarg($newoutput) . ' multistamp ' . escapeshellarg($sign) . ' output ' . escapeshellarg($output) . ' user_pw ' . escapeshellarg($password) . ' owner_pw ' . escapeshellarg($ownerpass) . ' ' . $allowcommand; // M9 review V1
 			}else{
-				$exec = Configure::read('PDFTkPath') . ' ' .$newoutput .' multistamp ' .$sign.  ' output '. $output .' ' . $allowcommand;
+				$exec = $this->_m9_pdftk() . ' ' . escapeshellarg($newoutput) . ' multistamp ' . escapeshellarg($sign) . ' output ' . escapeshellarg($output) . ' ' . $allowcommand; // M9 review V1
 			}
 			exec($exec);
 			unlink($newoutput);
@@ -5100,9 +5840,9 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 			$sign = $this->_sign_to_pdf($this->request->data['DocumentDownload']['signature'],$record_id,$this->request->data['DocumentDownload']['font_face'],$this->request->data['DocumentDownload']['font_size']);			
 			if($password && $password != ''){
 				$ownerpass = $password . '-owner';
-				$exec = Configure::read('PDFTkPath') . ' ' .$input .' multistamp ' .$sign.  ' output '. $output . ' user_pw '.$password.' owner_pw '.$ownerpass.' ' . $allowcommand;
+				$exec = $this->_m9_pdftk() . ' ' . escapeshellarg($input) . ' multistamp ' . escapeshellarg($sign) . ' output ' . escapeshellarg($output) . ' user_pw ' . escapeshellarg($password) . ' owner_pw ' . escapeshellarg($ownerpass) . ' ' . $allowcommand; // M9 review V1
 			}else{
-				$exec = Configure::read('PDFTkPath') . ' ' .$input .' multistamp ' .$sign.  ' output '. $output .' '. $allowcommand;
+				$exec = $this->_m9_pdftk() . ' ' . escapeshellarg($input) . ' multistamp ' . escapeshellarg($sign) . ' output ' . escapeshellarg($output) . ' ' . $allowcommand; // M9 review V1
 			}
 			exec($exec);
 			unlink($input);
@@ -5156,8 +5896,8 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 			if(!file_exists($path)){
 				mkdir($path);
 			}
-			chmod($dir,0777);
-			chmod($path,0777);
+			$this->_m9_mode($dir);
+			$this->_m9_mode($path);
 		}catch(Exception $e){
 			echo "Path creation failed";
 			exit;
@@ -5172,7 +5912,7 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 		if($this->viewVars['addwatermark'] == true){
 			$output = $path . DS . 'signpdf.pdf';
 			$background = WWW_ROOT . 'files' . DS . 'samples' . DS . $qcDocument['QcDocument']['document_status'].'.pdf';
-			$exec = Configure::read('PDFTkPath') . ' ' .$pagecontentfilename .' multistamp ' .$background.  ' output '. $output .'';
+			$exec = $this->_m9_pdftk() . ' ' . escapeshellarg($pagecontentfilename) . ' multistamp ' . escapeshellarg($background) . ' output ' . escapeshellarg($output); // M9 review V1
 			exec($exec);
 			unlink($pagecontentfilename);
 			$this->set('addwatermark',false);
@@ -5180,7 +5920,7 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 		}else{			
 			$output = $path . DS . 'signpdf.pdf';
 			$background = WWW_ROOT . 'files' . DS . 'samples' . DS . $qcDocument['QcDocument']['document_status'].'.pdf';
-			$exec = Configure::read('PDFTkPath') . ' ' .$pagecontentfilename .'  output '. $output .'';
+			$exec = $this->_m9_pdftk() . ' ' . escapeshellarg($pagecontentfilename) . ' output ' . escapeshellarg($output); // M9 review V1
 			exec($exec);
 			unlink($pagecontentfilename);
 			$this->set('addwatermark',false);
@@ -5198,12 +5938,29 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 		$this->render('/Elements/load_process');
 	}
 
+	// Owner's fifth review (16 Nov 2026), decisions 392 and 396: during a form-builder submit (CustomTables) generated code is only
+	// collected and written at the end with the rest of the submit, or not at all. Otherwise the file is written to a new name
+	// beside its target and renamed into place (never half written, never through a link, 0644, no chmod of the folder).
 	public function _write_to_file($folder = null, $file = null, $content = null){
-		if($content){
-			chmod($folder,0777);
-			$fp = fopen($file, 'w');
-			fwrite($fp, $content);
-			fclose($fp);
+		if (!$content) return true;
+		if (isset($this->m9Tx) && is_array($this->m9Tx) && method_exists($this, '_m9_tx_queue_file')) return $this->_m9_tx_queue_file($file, $content);
+		$file = (string)$file; $dir = dirname($file);
+		clearstatcache(true, $dir); clearstatcache(true, $file);
+		if (!is_dir($dir) || is_link($dir) || is_link($file) || is_dir($file)) { $this->_m9_ac_log('write_refused', basename($file)); return false; }
+		$lock = $this->_m9_file_lock($file);
+		if ($lock === false) { $this->_m9_ac_log('write_failed', basename($file) . ' file_busy'); return false; }
+		try {
+			clearstatcache(true, $dir); clearstatcache(true, $file);
+			if (!is_dir($dir) || is_link($dir) || is_link($file) || is_dir($file)) { $this->_m9_ac_log('write_refused', basename($file)); return false; }
+			$tmp = $dir . DS . '.m9w_' . bin2hex(random_bytes(6)) . '.tmp';
+			$h = @fopen($tmp, 'xb');
+			if ($h === false) { $this->_m9_ac_log('write_failed', basename($file)); return false; }
+			$n = fwrite($h, (string)$content); fflush($h); fclose($h);
+			if ($n !== strlen((string)$content) || !@rename($tmp, $file)) { @unlink($tmp); $this->_m9_ac_log('write_failed', basename($file)); return false; }
+			@chmod($file, 0644);
+			return true;
+		} finally {
+			$this->_m9_file_unlock($lock);
 		}
 	}
 
@@ -5244,10 +6001,53 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 		$this->_m9_sig_counter('user:'.$this->Session->read('User.id'), true);
 	}
 
-	public function _m9_password_matches($stored, $plain) {
+	// M9 password hashing (staging, 20 Oct 2026). New and changed passwords are stored with bcrypt (password_hash). Existing salted-MD5
+	// hashes keep working and are replaced by bcrypt after the next successful login, password check or signature check. Each replacement
+	// is a guarded update (only if the stored hash is still the old one) and is written to the rollback ledger tmp/m9_bcrypt_ledger.tsv (0600):
+	// user id, old hash, new hash, time. Rollback restores the old hash only where the account still holds the hash written by the upgrade.
+	public function _m9_is_bcrypt($h) {
+		return is_string($h) && preg_match('/^\$2[aby]\$\d\d\$/', $h) === 1;
+	}
+
+	public function _m9_password_hash($plain) {
+		return password_hash((string)$plain, PASSWORD_BCRYPT);
+	}
+
+	public function _m9_password_matches($stored, $plain, $userId = null) {
 		$stored = trim((string)$stored);
 		if ($stored === '' || !is_string($plain) || $plain === '') return false;
-		return hash_equals($stored, trim(Security::hash($plain, 'md5', true)));
+		if ($this->_m9_is_bcrypt($stored)) {
+			$ok = password_verify($plain, $stored);
+			if ($ok && $userId && password_needs_rehash($stored, PASSWORD_BCRYPT)) $this->_m9_password_upgrade($userId, $stored, $plain);
+			return $ok;
+		}
+		$ok = hash_equals($stored, trim(Security::hash($plain, 'md5', true)));
+		if ($ok && $userId) $this->_m9_password_upgrade($userId, $stored, $plain);
+		return $ok;
+	}
+
+	public function _m9_password_upgrade($userId, $old, $plain) {
+		$new = $this->_m9_password_hash($plain);
+		$this->loadModel('User');
+		$db = $this->User->getDataSource();
+		$done = $this->User->updateAll(array('User.password' => $db->value($new, 'string')), array('User.id' => $userId, 'User.password' => $old));
+		if ($done && $this->User->getAffectedRows() > 0) {
+			$f = TMP.'m9_bcrypt_ledger.tsv';
+			@file_put_contents($f, $userId."\t".$old."\t".$new."\t".date('Y-m-d H:i:s')."\n", FILE_APPEND | LOCK_EX);
+			@chmod($f, 0600);
+		}
+	}
+
+	// For code that matched users by password in a find condition: returns the stored hash of the one user matching $conditions
+	// if $plain verifies (after any upgrade), otherwise a value that matches no row.
+	public function _m9_password_condition($conditions, $plain) {
+		$this->loadModel('User');
+		$u = $this->User->find('first', array('recursive' => -1, 'fields' => array('User.id', 'User.password'), 'conditions' => $conditions));
+		if ($u && $this->_m9_password_matches($u['User']['password'], $plain, $u['User']['id'])) {
+			$r = $this->User->find('first', array('recursive' => -1, 'fields' => array('User.password'), 'conditions' => array('User.id' => $u['User']['id'])));
+			return $r['User']['password'];
+		}
+		return '!m9-no-match!';
 	}
 
 	public function _m9_signed_fields($model) {
@@ -5319,7 +6119,7 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 				$user = $this->User->find('first', array(
 					'fields' => array('User.id', 'User.password', 'User.employee_id', 'Employee.id', 'Employee.signature'),
 					'conditions' => array('User.status' => 1, 'User.soft_delete' => 0, 'User.publish' => 1, 'User.employee_id' => $signer)));
-				if ($user && $this->_m9_password_matches($user['User']['password'], $pw)) {
+				if ($user && $this->_m9_password_matches($user['User']['password'], $pw, $user['User']['id'])) {
 					$img = WWW_ROOT. DS. 'img'. DS . $this->Session->read('User.company_id'). DS .'signature'. DS. $user['Employee']['id']. DS. 'sign.png';
 					if (file_exists($img) || $user['Employee']['signature']) {
 						$ver = (array)$this->Session->read('M9Sign');
@@ -5369,7 +6169,7 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 		if ($this->_m9_sig_locked($me)) { $this->_m9_sig_log('checkpass_locked'); return 'Wrong password'; }
 		$this->loadModel('User');
 		$user = $this->User->find('first', array('conditions' => array('User.status' => 1, 'User.soft_delete' => 0, 'User.publish' => 1, 'User.username' => $this->Session->read('User.username'))));
-		if ($user && $this->_m9_password_matches($user['User']['password'], $pw)) return 'Proceed';
+		if ($user && $this->_m9_password_matches($user['User']['password'], $pw, $user['User']['id'])) return 'Proceed';
 		$this->_m9_sig_fail($me);
 		$this->_m9_sig_log('checkpass_failed');
 		return 'Wrong password';
@@ -5685,8 +6485,9 @@ public function _sent_approval_email($to = null,$message = null,$response = null
 			$fields = $this->$modelClass->schema();
 			if(array_key_exists('approval_step_id', $fields)){ 			
 			}else{
-				$updatesql = 'ALTER TABLE `'.$this->request->controller.'` ADD `approval_step_id` VARCHAR(36) NULL DEFAULT NULL AFTER `status_user_id`;';
-				$this->$modelClass->query($updatesql);
+				// Owner's fifth review (16 Nov 2026), decision 395 (overturns 391): FlinkISO no longer adds this column during a request.
+				// The deployment adds it to the form tables that lack it (step 6b); a table still without it is logged.
+				$this->_m9_ac_log('approval_step_id_missing', (string)$this->request->controller);
 
 			}
 

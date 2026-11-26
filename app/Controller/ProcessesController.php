@@ -235,7 +235,7 @@ class ProcessesController extends AppController {
 
             }else{
                 $folder = new Folder();
-                if ($folder->create($savepath,0777)) {
+                if ($folder->create($savepath,0755)) {
                 } else {
                     echo "Folder creation failed";
                     exit;
@@ -324,7 +324,7 @@ class ProcessesController extends AppController {
         if (!file_exists(Configure::read('path') . DS . $id)) {
             $pathfolder = new Folder();
             if ($pathfolder->create(Configure::read('path') . DS . $id)) {
-                chmod(Configure::read('path') . DS . $id,0777);
+                $this->_m9_mode(Configure::read('path') . DS . $id);
             } else {
                 echo "failed folder" . Configure::read('path');
                 $this->Session->setFlash(__('Folder creation failed. Please, try again.'));

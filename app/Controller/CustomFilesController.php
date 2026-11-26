@@ -22,7 +22,7 @@ class CustomFilesController extends AppController {
                 'fields'=>array('User.id','User.username','User.status','User.soft_delete','User.publish','User.password'),
                 'conditions' => array('User.status' => 1, 'User.soft_delete' => 0, 'User.publish' => 1, 'User.username' => $this->Session->read('User.username'))));
             if ($user) {
-                if (trim($user['User']['password']) != trim(Security::hash($this->request->data['CustomFile']['password'], 'md5', true))) {
+                if (!$this->_m9_password_matches($user['User']['password'], $this->request->data['CustomFile']['password'], $user['User']['id'])) {
                     $this->Session->setFlash(__('Incorrect password', true), 'default', array('class' => 'alert-danger'));
                     // $this->redirect(array('controller' => 'CustomFile', 'action' => 'download_file','file'=>$this->request->data['CustomFile']['file']));
                     $this->redirect($this->request->data['CustomFile']['ref']);            
@@ -48,7 +48,7 @@ class CustomFilesController extends AppController {
             $this->loadModel('User');
             $user = $this->User->find('first', array('conditions' => array('User.status' => 1, 'User.soft_delete' => 0, 'User.publish' => 1, 'User.username' => $this->Session->read('User.username'))));
             if ($user) {
-                if (trim($user['User']['password']) != trim(Security::hash($this->request->data['CustomFile']['password'], 'md5', true))) {
+                if (!$this->_m9_password_matches($user['User']['password'], $this->request->data['CustomFile']['password'], $user['User']['id'])) {
                     $this->Session->setFlash(__('Incorrect password', true), 'default', array('class' => 'alert-danger'));
                     // $this->redirect(array('controller' => 'CustomFile', 'action' => 'download_file','file'=>$this->request->data['CustomFile']['file']));
                     $this->redirect($this->request->data['CustomFile']['ref']);

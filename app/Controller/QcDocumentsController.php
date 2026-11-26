@@ -270,16 +270,20 @@ class QcDocumentsController extends AppController {
         if ($this->request->is('post') || $this->request->is('put')) {
             $this->request->data['QcDocument']['id'] = $id; $this->request->data['Approval']['QcDocument']['id'] = $id; // M9 correction 12: this document only
             $this->Session->setFlash(__('Approval Saved'));
-            if ($this->request->data['Approval']['user_id']) $this->_save_approvals();
+            // M9 correction 29 (owner review 9 Nov 2026): every approval write is checked; if one fails, the writes made by this
+            // request are undone and the page says so instead of "Approval Saved".
+            $this->_m9_approval_begin(); $m9ok = true;
+            if ($this->request->data['Approval']['user_id']) $m9ok = $this->_save_approvals();
             // M9 fix (staging, 14 Oct 2026): the forward form on this page posts Approval.QcDocument.user_id, which was never read here.
-            if (!empty($this->request->data['Approval']['QcDocument']['user_id'])) {
+            if ($m9ok && !empty($this->request->data['Approval']['QcDocument']['user_id'])) {
                 $this->request->data['Approval']['QcDocument']['id'] = $id;
                 $this->request->data['QcDocument']['id'] = $id;
                 $this->request->data['QcDocument']['model_name'] = 'QcDocument';
                 if (empty($this->request->data['Approval']['QcDocument']['from'])) $this->request->data['Approval']['QcDocument']['from'] = $this->Session->read('User.id');
-                $this->_save_approvals($id);
+                $m9ok = $this->_save_approvals($id);
             }
-            if ($this->request->data['ApprovalComment']['user_id']) $this->_save_approval_comments();
+            if ($m9ok && $this->request->data['ApprovalComment']['user_id']) $m9ok = $this->_save_approval_comments();
+            if ($m9ok) $this->_m9_approval_commit(); else $this->_m9_approval_abort_flash();
             $this->redirect(array('action' => 'view', $id));
         }
         
@@ -311,15 +315,17 @@ class QcDocumentsController extends AppController {
         if ($this->request->is('post') || $this->request->is('put')) {
             $this->request->data['QcDocument']['id'] = $id; $this->request->data['Approval']['QcDocument']['id'] = $id; // M9 correction 12: this document only
             $this->Session->setFlash(__('Approval Saved'));
-            if ($this->request->data['Approval']['user_id']) $this->_save_approvals();
-            if ($this->request->data['ApprovalComment']['user_id']) $this->_save_approval_comments();
+            $this->_m9_approval_begin(); $m9ok = true; // M9 correction 29
+            if ($this->request->data['Approval']['user_id']) $m9ok = $this->_save_approvals();
+            if ($m9ok && $this->request->data['ApprovalComment']['user_id']) $m9ok = $this->_save_approval_comments();
+            if ($m9ok) $this->_m9_approval_commit(); else $this->_m9_approval_abort_flash();
             $this->redirect(array('action' => 'view', $id));
         }
         $options = array('conditions' => array('QcDocument.' . $this->QcDocument->primaryKey => $id));        
         $qcDocument = $this->QcDocument->find('first', $options);
-        $qcDocument['QcDocument']['file_key'] = $this->_generate_onlyoffice_key($this->request->data['QcDocument']['id'] . date('Ymdhis'));
-        $this->QcDocument->create();
-        $this->QcDocument->save($qcDocument,false);
+        // M9 correction 22 (finding 2): viewing an archived document changes nothing. The viewer gets a key for this page only;
+        // it is not saved (it used to be saved on every visit, built from a posted id that a GET request does not carry).
+        $qcDocument['QcDocument']['file_key'] = $this->_generate_onlyoffice_key($id . 'v' . date('YmdHis'));
         $this->set('qcDocument', $qcDocument);
         $this->_commons($qcDocument['QcDocument']['created_by']);
         $this->set('childDocs', $this->_get_child_docs($id));
@@ -362,7 +368,7 @@ class QcDocumentsController extends AppController {
      */
     public function add() {
         if ( ! is_writable(dirname(WWW_ROOT . DS . 'files' . DS . $this->Session->read('User.company_id')))) {
-            $this->Session->setFlash(__('Files directory is not writable. Make sure to add 0777 permission (recursive) to "'.WWW_ROOT . DS . 'files" folder'));
+            $this->Session->setFlash(__('Files directory is not writable. Make sure the "'.WWW_ROOT . DS . 'files" folder is writable by the site\'s PHP user'));
             $this->redirect(array('action' => 'index'));
         }
         if($this->Session->read('User.is_creator') == 0){
@@ -375,7 +381,7 @@ class QcDocumentsController extends AppController {
             $newFolder->create(Configure::read('path'));
         }
         
-        chmod(Configure::read('path'),0777);
+        $this->_m9_mode(Configure::read('path'));
         if ($this->request->is('post') || $this->request->is('put')) {
             $accessptedExtentions = array(
                 'application/msword',
@@ -407,6 +413,8 @@ class QcDocumentsController extends AppController {
             $this->request->data['QcDocument']['title'] = $this->_clean_table_names(ltrim(rtrim($this->request->data['QcDocument']['title'])));
             $this->request->data['QcDocument']['document_number'] = ltrim(rtrim($this->request->data['QcDocument']['document_number']));
             $this->request->data['QcDocument']['revision_number'] = ltrim(rtrim($this->request->data['QcDocument']['revision_number']));
+            $m9why = $this->_m9_revision_check($this->request->data['QcDocument']['revision_number']); // M9 correction 22
+            if ($m9why !== '') { $this->Session->setFlash($m9why); $this->redirect(array('action' => 'add')); }
             $this->request->data['QcDocument']['branches'] = json_encode($this->request->data['QcDocument']['branches']);
             $this->request->data['QcDocument']['departments'] = json_encode($this->request->data['QcDocument']['departments']);
             $this->request->data['QcDocument']['designations'] = json_encode($this->request->data['QcDocument']['designations']);
@@ -481,7 +489,7 @@ class QcDocumentsController extends AppController {
                         if(!file_exists($to)){
                             $testfolder = new Folder($to);
                             $testfolder->create($to);
-                            chmod($to, 0777);
+                            $this->_m9_mode($to);
                         }
 
                         $to = $file;
@@ -507,7 +515,7 @@ class QcDocumentsController extends AppController {
                             $history_file_for_save = $history_file_for_save.'-hist' . DS . $version;
                             $historyFolder = new Folder($history_file_for_save);
                             $historyFolder->create($history_file_for_save);
-                            chmod($history_file_for_save, 0777);
+                            $this->_m9_mode($history_file_for_save);
                             file_put_contents($history_file_for_save . DS . "createdInfo.json", json_encode($json, JSON_PRETTY_PRINT));
                         }else{
                             $this->Session->setFlash(__('Unable to copy template.'));
@@ -515,9 +523,14 @@ class QcDocumentsController extends AppController {
                         }
                     }
                 }
-                if ($this->_show_approvals()) $this->_save_approvals($this->QcDocument->id);
+                $m9msg = __('The document has been saved');
+                if ($this->_show_approvals()) { // M9 correction 29: a failed approval request is undone and reported
+                    $this->_m9_approval_begin();
+                    if ($this->_save_approvals($this->QcDocument->id)) $this->_m9_approval_commit();
+                    else $m9msg = __('The document has been saved, but the approval request could not be sent.') . ($this->_m9_undo() ? '' : ' ' . __('Some changes could not be undone; this is recorded in the application log.'));
+                }
                 if($this->request->data['QcDocument']['document_type'] == 2)$this->_add_process($this->request->data,$this->QcDocument->id);
-                $this->Session->setFlash(__('The document has been saved'));
+                $this->Session->setFlash($m9msg);
                 $this->redirect(array('action' => 'index'));
             } else {
                 $this->Session->setFlash(__('The document could not be saved. Please, try again.'));
@@ -553,7 +566,7 @@ class QcDocumentsController extends AppController {
         if (!file_exists(Configure::read('path') . DS . $id)) {
             $pathfolder = new Folder();
             if ($pathfolder->create(Configure::read('path') . DS . $id)) {
-                chmod(Configure::read('path') . DS . $id,0777);
+                $this->_m9_mode(Configure::read('path') . DS . $id);
             } else {
                 echo "failed folder" . Configure::read('path');
             }
@@ -581,7 +594,7 @@ class QcDocumentsController extends AppController {
             $history_file_for_save = $history_file_for_save.'-hist' . DS . $version;
             $historyFolder = new Folder($history_file_for_save);
             $historyFolder->create($history_file_for_save);
-            chmod($history_file_for_save, 0777);
+            $this->_m9_mode($history_file_for_save);
             file_put_contents($history_file_for_save . DS . "createdInfo.json", json_encode($json, JSON_PRETTY_PRINT));
         } else {
             echo "File move failed!";
@@ -609,7 +622,7 @@ class QcDocumentsController extends AppController {
             $history_file_for_save = $history_file_for_save.'-hist' . DS . $version;
             $historyFolder = new Folder($history_file_for_save);
             $historyFolder->create($history_file_for_save);
-            chmod($history_file_for_save, 0777);
+            $this->_m9_mode($history_file_for_save);
             file_put_contents($history_file_for_save . DS . "createdInfo.json", json_encode($json, JSON_PRETTY_PRINT));
         }
     }
@@ -665,7 +678,7 @@ class QcDocumentsController extends AppController {
 
             if (!file_exists(Configure::read('path') . DS . $id)) {
                 $pathfolder = new Folder();
-                if ($pathfolder->create(Configure::read('path') . DS . $id,false,0777)) {
+                if ($pathfolder->create(Configure::read('path') . DS . $id,false,0755)) {
                 } else {
                     $this->Session->setFlash(__('failed folder' . Configure::read('path')));
                     $this->redirect(array('action' => 'view',$this->request->data['QcDocument']['id']));
@@ -674,11 +687,11 @@ class QcDocumentsController extends AppController {
                 $path = Configure::read('path') . DS . $id ;
                 $dir = new Folder();
                 $dir->create($path);
-                chmod($path, 0777);                
+                $this->_m9_mode($path);                
             }
 
             $folder_new_file = New Folder();
-            $folder_new_file->create(Configure::read('path') . DS . $id . DS . $file_name_for_folder, false, 0777);
+            $folder_new_file->create(Configure::read('path') . DS . $id . DS . $file_name_for_folder, false, 0755);
             
             if (move_uploaded_file($this->request->data['QcDocument']['file']['tmp_name'], $file)) {
                 $key = $this->_generate_onlyoffice_key($this->request->data['QcDocument']['id'] . date('Ymdhis'));
@@ -703,7 +716,7 @@ class QcDocumentsController extends AppController {
                 $history_file_for_save = $history_file_for_save.'-hist' . DS . $version;
                 $historyFolder = new Folder($history_file_for_save);
                 $historyFolder->create($history_file_for_save);
-                chmod($history_file_for_save, 0777);
+                $this->_m9_mode($history_file_for_save);
                 file_put_contents($history_file_for_save . DS . "createdInfo.json", json_encode($json, JSON_PRETTY_PRINT));
 
                 // now copy new file to custom tables
@@ -724,7 +737,7 @@ class QcDocumentsController extends AppController {
                         $delFolder = new Folder($customTableFolder);
                         
                         $dir = new Folder();
-                        $dir->create($customTableFolder, false, 0777);
+                        $dir->create($customTableFolder, false, 0755);
                         $to = $customTableFolder . DS . $file_name;
                         copy($file,$to);
                     }
@@ -754,7 +767,12 @@ class QcDocumentsController extends AppController {
         
         if (($this->request->is('post') || $this->request->is('put')) && !empty($this->request->data['QcDocument'])) {
             $this->request->data['QcDocument']['id'] = $id; // M9 correction 12: the document saved is the document in the address, which was checked
-            if($this->request->data['QcDocument']['document_type'] == 2)$this->_update_process($this->request->data,$this->request->data['QcDocument']['id']);
+            if (array_key_exists('revision_number', $this->request->data['QcDocument'])) { // M9 correction 22d (owner, 6 Nov 2026)
+                $m9why = $this->_m9_revision_unchanged($this->request->data['QcDocument']['revision_number'], $id);
+                if ($m9why !== '') { $this->_m9_ac_log('revision_change_refused', 'edit'); $this->Session->setFlash($m9why); $this->redirect(array('action' => 'edit', $id)); }
+                $this->request->data['QcDocument']['revision_number'] = (string)$this->QcDocument->field('revision_number', array('QcDocument.id' => $id));
+            }
+            // M9 correction 27 (owner, 6 Nov 2026): the linked processes are updated only after the document itself was saved (below)
             $this->request->data['QcDocument']['system_table_id'] = $this->_get_system_table_id();
             $this->request->data['QcDocument']['branches'] = json_encode($this->request->data['QcDocument']['share_with_branches']);
             $this->request->data['QcDocument']['departments'] = json_encode($this->request->data['QcDocument']['share_with_departments']);
@@ -790,15 +808,43 @@ class QcDocumentsController extends AppController {
             //     if($this->request->data['QcDocument']['prepared_by'] == -1)$this->request->data['QcDocument']['prepared_by'] = $this->request->data['Approval']['QcDocument']['prepared_by'];
             // }
 
-            if ($this->QcDocument->save($this->request->data)) {
-                // if ($this->_show_approvals())
-                if ($this->request->data['Approval']['QcDocument']['user_id']) $this->_save_approvals($this->QcDocument->id);
-                if ($this->request->data['ApprovalComment']['user_id']) $this->_save_approval_comments();
+            // M9 correction 27 (owner, 6 Nov 2026): the document is validated and saved first; only then are the linked processes
+            // updated, each save checked. On any failure the document and every process are put back exactly as they were
+            // (the tables are MyISAM, so there is no transaction) and nothing is reported as saved.
+            $m9docBefore = $this->QcDocument->find('first', array('recursive' => -1, 'conditions' => array('QcDocument.id' => $id)));
+            $this->loadModel('Process'); $m9procBefore = $this->Process->find('all', array('recursive' => -1, 'conditions' => array('Process.qc_document_id' => $id))); // M9 correction 29: put back if the approval step fails
+            try { $m9saved = (bool)$this->QcDocument->save($this->request->data); } // a database error throws in CakePHP 2
+            catch (Exception $m9e) { $m9saved = false; $m9back = $this->_m9_put_back('QcDocument', isset($m9docBefore['QcDocument']) ? $m9docBefore['QcDocument'] : null); $this->_m9_ac_log('edit_failed_restored', substr((string)$id, 0, 8) . ' document_save_error' . ($m9back ? '' : ' document_restore_failed:' . $this->m9PutBackDiff)); }
+            if ($m9saved && $this->request->data['QcDocument']['document_type'] == 2) {
+                $m9proc = $this->_update_process($this->request->data, $id);
+                if ($m9proc !== true) {
+                    $m9back = $this->_m9_put_back('QcDocument', isset($m9docBefore['QcDocument']) ? $m9docBefore['QcDocument'] : null);
+                    $this->_m9_ac_log('edit_failed_restored', substr((string)$id, 0, 8) . ' ' . $m9proc . ($m9back ? '' : ' document_restore_failed:' . $this->m9PutBackDiff));
+                    $m9saved = false;
+                }
+            }
+            if ($m9saved) {
+                // M9 correction 29 (owner review 9 Nov 2026, finding 1): the approval request and the approval comment are checked.
+                // If either fails, everything this save wrote is undone, the document and its linked processes are put back as
+                // they were, and nothing is reported as saved.
+                $this->_m9_approval_begin(); $m9ok = true;
+                if ($this->request->data['Approval']['QcDocument']['user_id']) $m9ok = $this->_save_approvals($this->QcDocument->id);
+                if ($m9ok && $this->request->data['ApprovalComment']['user_id']) $m9ok = $this->_save_approval_comments();
+                if ($m9ok) $this->_m9_approval_commit();
+                else {
+                    $m9undo = $this->_m9_undo();
+                    $m9pb = true; foreach ($m9procBefore as $m9p) if (isset($m9p['Process']) && false === $this->_m9_put_back('Process', $m9p['Process'])) $m9pb = false;
+                    $m9back = $this->_m9_put_back('QcDocument', isset($m9docBefore['QcDocument']) ? $m9docBefore['QcDocument'] : null);
+                    $this->_m9_ac_log('edit_failed_restored', substr((string)$id, 0, 8) . ' ' . $this->m9ApprovalError . ($m9undo ? '' : ' approval_undo_failed') . ($m9pb ? '' : ' process_restore_failed') . ($m9back ? '' : ' document_restore_failed:' . $this->m9PutBackDiff));
+                    $m9saved = false;
+                }
+            }
+            if ($m9saved) {
                 if ($this->_show_evidence() == true) $this->redirect(array('action' => 'view', $id));
                 else                
                     $this->redirect(array('action' => 'view', $id,'timestamp'=>date('ymdhis')));
             } else {
-                $this->Session->setFlash(__('The document could not be saved. Please, try again.'));
+                $this->Session->setFlash(__('The document could not be saved. Please, try again.') . ($this->m9ApprovalMessage !== '' ? ' ' . __($this->m9ApprovalMessage) : ''));
             }
         } else {
             $access = $this->request->data['Access'];
@@ -831,7 +877,7 @@ class QcDocumentsController extends AppController {
             if (!file_exists(Configure::read('path') . DS . $this->request->data['QcDocument']['id'])) {
                 $pathfolder = new Folder();
                 if ($pathfolder->create(Configure::read('path') . DS . $this->request->data['QcDocument']['id'])) {
-                    chmod(Configure::read('path') . DS . $this->request->data['QcDocument']['id'],0777);
+                    $this->_m9_mode(Configure::read('path') . DS . $this->request->data['QcDocument']['id']);
                 } else {
                     echo "failed folder" . Configure::read('path');
                 }
@@ -907,7 +953,11 @@ class QcDocumentsController extends AppController {
                 }
                 if ($this->QcDocument->save($this->request->data)) {
                     $this->Session->setFlash(__('The document has been saved.'));
-                    if ($this->_show_approvals()) $this->_save_approvals();
+                    if ($this->_show_approvals()) { // M9 correction 29: a failed approval request is undone and reported
+                        $this->_m9_approval_begin();
+                        if ($this->_save_approvals()) $this->_m9_approval_commit();
+                        else $this->Session->setFlash(__('The document has been saved, but the approval request could not be sent.') . ($this->_m9_undo() ? '' : ' ' . __('Some changes could not be undone; this is recorded in the application log.')));
+                    }
                 } else {
                     $this->Session->setFlash(__('The document could not be saved. Please, try again.'));
                 }
@@ -952,7 +1002,7 @@ class QcDocumentsController extends AppController {
             $this->loadModel('User');
             $user = $this->User->find('first', array('conditions' => array('User.status' => 1, 'User.soft_delete' => 0, 'User.publish' => 1, 'User.username' => $this->Session->read('User.username'))));
             if ($user) {
-                if (trim($user['User']['password']) != trim(Security::hash($this->request->data['QcDocument']['password'], 'md5', true))) {
+                if (!$this->_m9_password_matches($user['User']['password'], $this->request->data['QcDocument']['password'], $user['User']['id'])) {
                     $this->Session->setFlash(__('Incorrect password', true), 'default', array('class' => 'alert-danger'));
                 } else {
                     $doc = $this->QcDocument->find('first',array(
@@ -1012,7 +1062,7 @@ class QcDocumentsController extends AppController {
             $this->loadModel('User');
             $user = $this->User->find('first', array('conditions' => array('User.status' => 1, 'User.soft_delete' => 0, 'User.publish' => 1, 'User.username' => $this->Session->read('User.username'))));
             if ($user) {
-                if (trim($user['User']['password']) != trim(Security::hash($this->request->data['QcDocument']['password'], 'md5', true))) {
+                if (!$this->_m9_password_matches($user['User']['password'], $this->request->data['QcDocument']['password'], $user['User']['id'])) {
                     $this->Session->setFlash(__('Incorrect password', true), 'default', array('class' => 'alert-danger'));
                 } else {
                     $this->autoRender = false;
@@ -1102,7 +1152,7 @@ class QcDocumentsController extends AppController {
         if(!file_exists($to)){
             $testfolder = new Folder($to);
             $testfolder->create($to);
-            chmod($to, 0777);
+            $this->_m9_mode($to);
         }
         $from = WWW_ROOT . 'files' . DS . 'samples' .DS . 'sample.'.$filetype;        
         $to = $to . DS . 'blank.'.$filetype;        
@@ -1344,108 +1394,127 @@ class QcDocumentsController extends AppController {
 
     public function update_revision($id = null){
         if ($this->request->is('post') || $this->request->is('put')) {
-            // first check if revision number already exists
-
-            $revCheck = $this->QcDocument->find('count',array(
-                'conditions'=>array(
-                    'QcDocument.id'=>$this->request->data['QcDocument']['id'],
-                    'OR'=>array(
-                        'QcDocument.revision_number'=>$this->request->data['QcDocument']['revision_number'],
-                        'QcDocument.revision_number >'=>$this->request->data['QcDocument']['revision_number']
-                        )
-                    )
-            ));
-            if($revCheck > 0){
-                $this->Session->setFlash(__('Either revision number already exists, OR current revision number is less then existing revision numbers.'));
-                $this->redirect(array('action' => 'update_revision',$this->request->data['QcDocument']['id'],'timestamp'=>date('Ymdhis')));
+            // M9 correction 22 (owner review 30 Oct 2026, findings 1, 3 and 4). Everything is checked before anything changes:
+            // the revision number and date, the change request and replacement file (rebuilt on the server, the posted values
+            // must match them), and both files on disk. The current file path is built on the server; the posted replace_file
+            // is no longer used. Files are copied and verified first, then the two records are saved, then the document folder
+            // is swapped. qc_documents is MyISAM (no transaction rollback), so a failure after a save is undone explicitly:
+            // the archive row is deleted and the active row is saved back with its original values; files are put back.
+            $id = (isset($this->request->data['QcDocument']['id']) && is_scalar($this->request->data['QcDocument']['id'])) ? trim((string)$this->request->data['QcDocument']['id']) : '';
+            $back = array('action' => 'update_revision', $id, 'timestamp' => date('Ymdhis'));
+            $stop = function ($msg) use ($back) { $this->Session->setFlash($msg); $this->redirect($back); };
+            $qcDocument = ($id === '') ? array() : $this->QcDocument->find('first', array('conditions' => array('QcDocument.id' => $id), 'recursive' => -1));
+            if (empty($qcDocument) || $qcDocument['QcDocument']['archived'] == 1) {
+                $this->Session->setFlash(__('Document not found or already archived.'));
+                $this->redirect(array('action' => 'index'));
             }
-            $qcDocument = $this->QcDocument->find('first',array('conditions'=>array('QcDocument.id'=>$this->request->data['QcDocument']['id']),'recursive'=>-1));
+            $oldRev = trim((string)$qcDocument['QcDocument']['revision_number']);
+            $newRev = isset($this->request->data['QcDocument']['revision_number']) ? $this->request->data['QcDocument']['revision_number'] : null;
+            $why = $this->_m9_revision_check($newRev, $id, true);
+            if ($why !== '') $stop($why);
+            $newRev = trim((string)$newRev);
+            $revDate = (isset($this->request->data['QcDocument']['revision_date']) && is_scalar($this->request->data['QcDocument']['revision_date'])) ? trim((string)$this->request->data['QcDocument']['revision_date']) : '';
+            $d = DateTime::createFromFormat('Y-m-d', $revDate);
+            if (false === $d || $d->format('Y-m-d') !== $revDate) $stop(__('Revision date must be a valid date (YYYY-MM-DD).'));
+            $src = $this->_m9_revision_sources($id);
+            if (is_string($src)) { $this->_m9_ac_log('revision_refused', $src); $stop(__('No change request with a replacement file was found for this document. Nothing was changed.')); }
+            foreach (array('cr_id' => $src['cr_id'], 'new_file_id' => $src['file_id']) as $f => $want) {
+                $got = (isset($this->request->data['QcDocument'][$f]) && is_scalar($this->request->data['QcDocument'][$f])) ? trim((string)$this->request->data['QcDocument'][$f]) : '';
+                if ($got !== (string)$want) $this->_m9_ac_refuse('revision_source_mismatch', $f);
+            }
+            $apr = $this->_m9_cr_approved($src['model'], $src['cr_id']); // M9 correction 22d (owner, 6 Nov 2026)
+            if ($apr !== '') { $this->_m9_ac_log('revision_refused', 'cr_not_approved:' . $apr); $stop(__('The change request for this document has not been formally approved. Nothing was changed.')); }
+            $type = strtolower((string)$qcDocument['QcDocument']['file_type']);
+            if (preg_match('/^[a-z0-9]{1,6}$/', $type) !== 1) $stop(__('The document has no valid file type. Nothing was changed.'));
+            $base = realpath(Configure::read('path'));
+            $activeDir = Configure::read('path') . DS . $id;
+            $current = $activeDir . DS . $this->_clean_table_names($qcDocument['QcDocument']['document_number'] . '-' . $qcDocument['QcDocument']['title'] . '-' . $oldRev) . '.' . $type;
+            if (false === is_file($current)) {
+                $c = array(); foreach ((array)glob($activeDir . DS . '*.' . $type) as $g) if (is_file($g)) $c[] = $g;
+                $current = (count($c) === 1) ? $c[0] : '';
+            }
+            $rc = ($current === '') ? false : realpath($current);
+            if (false === $base || false === $rc || strpos($rc, $base . DS . $id . DS) !== 0 || false === is_readable($rc)) {
+                $this->_m9_ac_log('revision_refused', 'current_file');
+                $stop(__('The current document file could not be found. Nothing was changed.'));
+            }
+            $this->loadModel('DownloadFile');
+            $nf = $this->DownloadFile->find('first', array('recursive' => -1, 'conditions' => array('DownloadFile.id' => $src['file_id'])));
+            $filesBase = realpath(Configure::read('files'));
+            $newPath = $nf ? Configure::read('files') . DS . 'files' . DS . $nf['DownloadFile']['id'] . DS . $nf['DownloadFile']['name'] . '.' . $nf['DownloadFile']['file_type'] : '';
+            $rn = ($newPath === '') ? false : realpath($newPath);
+            if (false === $filesBase || false === $rn || strpos($rn, $filesBase . DS . 'files' . DS) !== 0 || false === is_file($rn) || false === is_readable($rn)) {
+                $this->_m9_ac_log('revision_refused', 'replacement_file');
+                $stop(__('The replacement file could not be found. Nothing was changed.'));
+            }
+            $ts = date('YmdHis');
+            $archiveDir = Configure::read('files') . DS . 'archive' . DS . $id . DS . $oldRev . DS . $src['cr_id'];
+            $archiveFile = $archiveDir . DS . 'archived.' . $type;
+            $newName = $this->_clean_table_names($qcDocument['QcDocument']['document_number'] . '-' . $qcDocument['QcDocument']['title'] . '-' . $newRev) . '.' . $type;
+            $stage = $activeDir . '.m9new_' . $ts;
+            $aside = $activeDir . '.m9old_' . $ts;
+            if (file_exists($archiveFile)) $stop(__('This revision is already archived for this change request. Nothing was changed.'));
+            $clean = function () use ($archiveFile, $stage) {
+                if (is_file($archiveFile)) @unlink($archiveFile);
+                if (is_dir($stage)) { $f = new Folder(); $f->delete($stage); }
+            };
+            // 1. archive copy of the current file, verified
+            $mk = new Folder();
+            if (false === is_dir($archiveDir) && false === $mk->create($archiveDir, 0755)) $stop(__('The archive folder could not be created. Nothing was changed.'));
+            if (false === @copy($rc, $archiveFile) || hash_file('sha256', $rc) !== hash_file('sha256', $archiveFile)) { $clean(); $stop(__('The current document could not be archived. Nothing was changed.')); }
+            // 2. replacement file staged next to the document folder, verified
+            if (false === $mk->create($stage, 0755) || false === @copy($rn, $stage . DS . $newName) || hash_file('sha256', $rn) !== hash_file('sha256', $stage . DS . $newName)) { $clean(); $stop(__('The replacement file could not be prepared. Nothing was changed.')); }
+            // 3. both records (a transaction where the engine supports it; undone explicitly below in any case)
+            $original = $qcDocument;
             $archiveQcDocument = $qcDocument;
-            unset($archiveQcDocument['QcDocument']['id']);
-            unset($archiveQcDocument['QcDocument']['sr_no']);
-            //adjust revision number 
-            // $archiveQcDocument['QcDocument']['revision_number'] = $qcDocument['QcDocument']['revision_number'];
+            unset($archiveQcDocument['QcDocument']['id'], $archiveQcDocument['QcDocument']['sr_no']);
+            $archiveQcDocument['QcDocument']['revision_number'] = $oldRev;
             $archiveQcDocument['QcDocument']['publish'] = 0;
             $archiveQcDocument['QcDocument']['archived'] = 1;
-            $archiveQcDocument['QcDocument']['cr_id'] = $this->request->data['QcDocument']['cr_id'];
-            $archiveQcDocument['QcDocument']['parent_id'] = $qcDocument['QcDocument']['id'];
+            $archiveQcDocument['QcDocument']['cr_id'] = $src['cr_id'];
+            $archiveQcDocument['QcDocument']['parent_id'] = $id;
             $archiveQcDocument['QcDocument']['modified'] = date('Y-m-d H:i:s');
             $archiveQcDocument['QcDocument']['modified_by'] = $this->Session->read('User.id');
-            $archiveQcDocument['QcDocument']['file_key'] = $this->_generate_onlyoffice_key($qcDocument['QcDocument']['id'] . date('Ymdhis'));
+            $archiveQcDocument['QcDocument']['file_key'] = $this->_generate_onlyoffice_key($id . 'a' . $ts);
             $archiveQcDocument['QcDocument']['document_status'] = 4;
-            $this->QcDocument->create();
-            $this->QcDocument->Save($archiveQcDocument,false);
-            //after saving archive record, update current record
-            // set publish = 1
-            // set document_status = 5
-            $qcDocument['QcDocument']['revision_number'] = $archiveQcDocument['QcDocument']['revision_number'];
-            $qcDocument['QcDocument']['revision_date'] = $this->request->data['QcDocument']['revision_date'];
+            $qcDocument['QcDocument']['revision_number'] = $newRev;
+            $qcDocument['QcDocument']['revision_date'] = $revDate;
             $qcDocument['QcDocument']['publish'] = 1;
             $qcDocument['QcDocument']['document_status'] = 5;
             $qcDocument['QcDocument']['modified'] = date('Y-m-d H:i:s');
             $qcDocument['QcDocument']['modified_by'] = $this->Session->read('User.id');
-            $qcDocument['QcDocument']['file_key'] = $this->_generate_onlyoffice_key($qcDocument['QcDocument']['id'] . date('Ymdhis'));
+            $qcDocument['QcDocument']['file_key'] = $this->_generate_onlyoffice_key($id . 'c' . $ts);
+            $ds = $this->QcDocument->getDataSource();
+            $ds->begin();
+            $archiveId = null; $activeSaved = false;
             $this->QcDocument->create();
-            $this->QcDocument->Save($qcDocument,false);
-            // after saving this record, create folder - files/company_id/archive/qc_document_id/revision_number/cr_id/
-            $archiveFolder = Configure::read('files') . DS . 'archive' . DS . $this->request->data['QcDocument']['id'] . DS .$archiveQcDocument['QcDocument']['revision_number'] . DS . $this->request->data['QcDocument']['cr_id'] ;
-            $createFolder = New Folder();
-            $createFolder->create($archiveFolder, 0777);
-            $from = $this->request->data['QcDocument']['replace_file'];
-            if(file_exists($from)){
-                // echo "yes";
-            }else{
-                // echo "No";
+            $ok = (bool)$this->QcDocument->save($archiveQcDocument, false);
+            if ($ok) $archiveId = $this->QcDocument->id;
+            if ($ok) { $this->QcDocument->create(); $ok = (bool)$this->QcDocument->save($qcDocument, false); $activeSaved = $ok; }
+            // 4. swap the document folder: current folder aside, staged folder in its place
+            $moved = false;
+            if ($ok) {
+                $moved = @rename($activeDir, $aside);
+                $ok = $moved && @rename($stage, $activeDir);
             }
-            $file = $archiveFolder. DS . 'archived.'.$qcDocument['QcDocument']['file_type'];
-            $to = $file;
-            $fromFile = new File($from);
-            $fromFile->copy($to,false);
-            if(copy($from,$to)){
-
-            }else{
-                echo "Something went wrong. System could not find the original document";
+            if ($ok) $ok = (bool)$ds->commit();
+            if (false === $ok) {
+                if ($moved) { if (is_dir($activeDir) && false === is_dir($stage)) @rename($activeDir, $stage); @rename($aside, $activeDir); }
+                $ds->rollback();
+                if ($activeSaved) { // put every column back exactly (updateAll: no callbacks, no automatic modified date)
+                    $dbs = $this->QcDocument->getDataSource(); $set = array();
+                    foreach ($original['QcDocument'] as $k => $v) if ($k !== 'id' && $k !== 'sr_no') $set['QcDocument.' . $k] = $dbs->value($v);
+                    $this->QcDocument->updateAll($set, array('QcDocument.id' => $id));
+                }
+                if ($archiveId) $this->QcDocument->deleteAll(array('QcDocument.id' => $archiveId), false, false);
+                $clean();
+                $this->_m9_ac_log('revision_failed_restored', substr($id, 0, 8));
+                $stop(__('The revision could not be saved. The document, its file and its records are unchanged.'));
             }
-            // move new files from files folder to qc document folder
-            // rename that file with new version number
-            $file_name = $qcDocument['QcDocument']['title'];
-            $document_number = $qcDocument['QcDocument']['document_number'];
-            $document_version = $qcDocument['QcDocument']['revision_number']-1;
-            $file_name = $document_number . '-' . $file_name . '-' . $document_version;
-            $file_name = $this->_clean_table_names($file_name);
-            $file_name = $file_name. '.' . $qcDocument['QcDocument']['file_type'];
-            // $id = $this->QcDocument->id;
-            $oldFilePath = Configure::read('path') . DS . $qcDocument['QcDocument']['id'];
-            // $oldFile = Configure::read('path') . DS . $qcDocument['QcDocument']['id'] . DS . $file_name;
-            // ----
-            if($qcDocument['QcDocument']['id']){
-                $createFolder = New Folder();
-                $createFolder->delete($oldFilePath);
-            }
-            $createFolder = New Folder();
-            $createFolder->create($oldFilePath, 0777);
-            // -----
-            $this->loadModel('DownloadFile');
-            $newFile = $this->DownloadFile->find('first',array('conditions'=>array('DownloadFile.id'=>$this->request->data['QcDocument']['new_file_id'])));            
-            $new_file_path = Configure::read('files')  . DS . 'files' . DS . $newFile['DownloadFile']['id'] . DS . $newFile['DownloadFile']['name'].'.'.$newFile['DownloadFile']['file_type'];
-            $file_name = $qcDocument['QcDocument']['title'];
-            $document_number = $qcDocument['QcDocument']['document_number'];
-            $document_version = $qcDocument['QcDocument']['revision_number'];
-            $file_name = $document_number . '-' . $file_name . '-' . $document_version;
-            $file_name = $this->_clean_table_names($file_name);
-            $file_name = $file_name. '.' . $qcDocument['QcDocument']['file_type'];
-            //final copy
-            $from = $new_file_path;
-            $to = $oldFilePath. DS .$file_name;            
-            $fromFile = new File($from);
-            $fromFile->copy($to,false);
-            if(copy($from,$to)){
-                $this->Session->setFlash(__('Change request successfully completed. Document successfully updated.'));
-                $this->redirect(array('action' => 'view', $qcDocument['QcDocument']['id']));
-            }else{
-                $this->Session->setFlash(__('Something went wrong. System cound not find the original document.'));
-                $this->redirect(array('action' => 'update_revision',$this->request->data['QcDocument']['id'],'timestamp'=>date('Ymdhis')));
-            }
+            $f = new Folder(); $f->delete($aside);
+            $this->_m9_ac_log('revision_saved', substr($id, 0, 8) . ' ' . $oldRev . '>' . $newRev);
+            $this->Session->setFlash(__('Change request successfully completed. Document successfully updated.'));
+            $this->redirect(array('action' => 'view', $id));
         }else{
             // get CR table
             $this->loadModel('Company');
@@ -1502,6 +1571,98 @@ class QcDocumentsController extends AppController {
         }
     }
 
+    // M9 correction 22: server-side check of a revision number on every path that saves one (add, add_bulk, edit, rename,
+    // update_revision). A revision is a whole number from 0 to 9999. It may not be below the highest archived revision of the
+    // document; a new revision (update_revision) must be above the current revision and every archived one.
+    // Returns '' when the value is accepted, otherwise the message to show.
+    public function _m9_revision_check($v, $id = null, $newRevision = false) {
+        if (false === is_scalar($v) || preg_match('/^[0-9]{1,4}$/', trim((string)$v)) !== 1) return __('Revision number must be a whole number from 0 to 9999.');
+        if ($id === null || false === is_scalar($id) || (string)$id === '') return '';
+        $v = (int)trim((string)$v);
+        $a = $this->QcDocument->find('first', array('recursive' => -1, 'fields' => array('MAX(CAST(QcDocument.revision_number AS SIGNED)) AS m'), 'conditions' => array('QcDocument.parent_id' => $id, 'QcDocument.archived' => 1)));
+        $m = (isset($a[0]['m']) && $a[0]['m'] !== null) ? (int)$a[0]['m'] : null;
+        if ($newRevision) {
+            $cur = (int)$this->QcDocument->field('revision_number', array('QcDocument.id' => $id));
+            if ($v <= $cur) return __('The new revision number must be higher than the current revision (%s).', $cur);
+            if ($m !== null && $v <= $m) return __('The new revision number must be higher than every archived revision (%s).', $m);
+        } elseif ($m !== null && $v < $m) {
+            return __('Revision number may not be lower than the highest archived revision (%s).', $m);
+        }
+        return '';
+    }
+
+    // M9 correction 22: the change request and replacement file for a revision, found on the server exactly as the
+    // update_revision page finds them (latest record of the change management form for this document, last attached file).
+    // Returns array('cr_id', 'file_id') or a reason.
+    public function _m9_revision_sources($id) {
+        $this->loadModel('Company');
+        $company = $this->Company->find('first', array('recursive' => -1, 'conditions' => array('Company.id' => $this->Session->read('User.company_id')), 'fields' => array('Company.id', 'Company.change_management_table')));
+        if (empty($company['Company']['change_management_table'])) return 'no_change_table';
+        $ct = $this->QcDocument->CustomTable->find('first', array('recursive' => -1, 'conditions' => array('CustomTable.id' => $company['Company']['change_management_table']), 'fields' => array('CustomTable.id', 'CustomTable.table_name')));
+        if (empty($ct)) return 'change_table_unknown';
+        $model = Inflector::Classify($ct['CustomTable']['table_name']);
+        $this->loadModel($model);
+        $rec = $this->$model->find('first', array('recursive' => -1, 'order' => array($model . '.sr_no' => 'DESC'), 'conditions' => array($model . '.document_for_change' => $id)));
+        if (empty($rec[$model]['id'])) return 'no_change_request';
+        $files = json_decode((string)$rec[$model]['additional_files'], true);
+        if (false === is_array($files)) return 'no_replacement_file';
+        $this->loadModel('File');
+        $fid = '';
+        foreach ($files as $x) {
+            if (false === is_scalar($x)) continue;
+            $f = $this->File->find('first', array('recursive' => -1, 'conditions' => array('File.id' => $x), 'fields' => array('File.id')));
+            if ($f) $fid = (string)$f['File']['id'];
+        }
+        if ($fid === '') return 'no_replacement_file';
+        return array('cr_id' => (string)$rec[$model]['id'], 'file_id' => $fid, 'model' => $model);
+    }
+
+    // M9 correction 22d (owner, 6 Nov 2026): edit and rename may not change the revision number; only update_revision does.
+    // The posted value must equal the stored value exactly; a missing value is accepted on rename (the stored one is kept).
+    // Returns '' when accepted, otherwise the message to show.
+    public function _m9_revision_unchanged($v, $id, $missingOk = false) {
+        $cur = $this->QcDocument->field('revision_number', array('QcDocument.id' => $id));
+        if ($v === null && $missingOk) return '';
+        if (is_scalar($v) && trim((string)$v) === trim((string)$cur)) return '';
+        return __('The revision number cannot be changed here (current revision %s). Revisions are made only through Update Revision with an approved change request.', $cur);
+    }
+
+    // M9 correction 22d (owner, 6 Nov 2026): a revision needs a formally approved change request. Checked from stored data
+    // only, never from posted values: the request exists, is not deleted, is published and has an approver; it has approval
+    // requests, every request of its latest approval cycle is closed (status 1) and was addressed to someone other than the
+    // request's creator; no response says Not Approved; and the request was not changed after its final approval.
+    // Returns '' when approved, otherwise the reason (logged, never shown).
+    public function _m9_cr_approved($model, $crId) {
+        if (false === is_string($model) || $model === '' || false === is_scalar($crId) || (string)$crId === '') return 'no_request';
+        $this->loadModel($model);
+        $cr = $this->$model->find('first', array('recursive' => -1, 'conditions' => array($model . '.id' => (string)$crId)));
+        if (empty($cr[$model]['id'])) return 'no_request';
+        $r = $cr[$model];
+        if (isset($r['soft_delete']) && (int)$r['soft_delete'] !== 0) return 'deleted';
+        if (false === isset($r['publish']) || (int)$r['publish'] !== 1) return 'not_published';
+        if (empty($r['approved_by'])) return 'no_approver';
+        $this->loadModel('Approval');
+        $aps = array();
+        foreach ($this->Approval->find('all', array('recursive' => -1, 'conditions' => array('Approval.model_name' => $model, 'Approval.record' => (string)$crId))) as $a) {
+            if (isset($a['Approval']['soft_delete']) && (int)$a['Approval']['soft_delete'] === 1) continue;
+            $aps[] = $a['Approval'];
+        }
+        if (empty($aps)) return 'no_approval';
+        $cycle = max(array_map(function ($a) { return (int)$a['approval_cycle']; }, $aps));
+        $ids = array(); $last = '';
+        foreach ($aps as $a) {
+            if ((int)$a['approval_cycle'] !== $cycle) continue;
+            if ((string)$a['status'] !== '1') return 'approval_open';
+            if ((string)$a['user_id'] === '' || (string)$a['user_id'] === (string)$r['created_by']) return 'self_approval';
+            $ids[] = (string)$a['id'];
+            if ((string)$a['modified'] > $last) $last = (string)$a['modified'];
+        }
+        $this->loadModel('ApprovalComment');
+        if ($this->ApprovalComment->find('count', array('recursive' => -1, 'conditions' => array('ApprovalComment.approval_id' => $ids, 'ApprovalComment.user_id' => 'Not Approved'))) > 0) return 'not_approved';
+        if ($last === '' || strtotime((string)$r['modified']) > strtotime($last) + 5) return 'changed_after_approval';
+        return '';
+    }
+
     public function load_revisions($id = null){
         $qcDocuments = $this->QcDocument->find('all',array('conditions'=>array('QcDocument.parent_id'=>$this->request->params['named']['id'])));
         $this->set('qcDocuments',$qcDocuments);
@@ -1528,8 +1689,12 @@ class QcDocumentsController extends AppController {
 
     public function _update_process($data = null,$id = null){
         $this->loadModel('Process');
+        // M9 correction 25 (owner, 6 Nov 2026): $processes was never defined, so linked processes were never updated.
+        $processes = (is_scalar($id) && (string)$id !== '') ? $this->Process->find('all', array('recursive' => -1, 'conditions' => array('Process.qc_document_id' => (string)$id))) : array();
+        $m9done = array(); // M9 correction 27: originals of the processes already saved, to put back on a failure
         if($processes){
             foreach($processes as $process){
+                $m9orig = $process['Process'];
                 $process['Process']['name'] = $data['QcDocument']['title'];
                 $process['Process']['qc_document_id'] = $id;
                 $process['Process']['applicable_to_branches'] = json_encode($data['QcDocument']['share_with_branches']);
@@ -1540,14 +1705,27 @@ class QcDocumentsController extends AppController {
                 $process['Process']['prepared_by'] = $data['QcDocument']['prepared_by'];
                 $process['Process']['approved_by'] = $data['QcDocument']['approved_by'];
                 $this->Process->create();
-                $this->Process->save($process['Process'],false);
+                try { $m9ok = (bool)$this->Process->save($process['Process'],false); } catch (Exception $m9e) { $m9ok = false; } // M9 correction 27: every save checked (a database error throws)
+                if (false === $m9ok) {
+                    $m9bad = 'process_save_failed:' . substr((string)$m9orig['id'], 0, 8);
+                    $m9done[] = $m9orig;
+                    foreach (array_reverse($m9done) as $m9o) if (false === $this->_m9_put_back('Process', $m9o)) $m9bad .= ' process_restore_failed:' . substr((string)$m9o['id'], 0, 8) . ':' . $this->m9PutBackDiff;
+                    return $m9bad;
+                }
+                $m9done[] = $m9orig;
             }
         }
         return true;
     }
 
+    // M9 correction 30 (owner review 9 Nov 2026): _m9_put_back is now in AppController (NULL-aware comparison).
+
     public function add_bulk(){
         if ($this->request->is('post') || $this->request->is('put')) {
+            foreach ((array)$this->request->data['Docs'] as $m9doc) { // M9 correction 22: every row is checked before any is saved
+                $m9why = $this->_m9_revision_check(isset($m9doc['QcDocument']['revision_number']) ? $m9doc['QcDocument']['revision_number'] : null);
+                if ($m9why !== '') { $this->Session->setFlash($m9why); $this->redirect(array('action' => 'add_bulk')); }
+            }
             foreach($this->request->data['Docs'] as $qcDocument){
                 $qcDocument['QcDocument']['name'] = ltrim(rtrim($qcDocument['QcDocument']['title']));
                 $qcDocument['QcDocument']['title'] =ltrim(rtrim($this->_clean_table_names($qcDocument['QcDocument']['title'])));
@@ -1592,7 +1770,7 @@ class QcDocumentsController extends AppController {
                     if(!file_exists($to)){
                         $testfolder = new Folder($to);
                         $testfolder->create($to);
-                        chmod($to, 0777);
+                        $this->_m9_mode($to);
                     }
                     $to = $file;
                     $fromFile = new File($from);
@@ -1615,7 +1793,7 @@ class QcDocumentsController extends AppController {
                         $history_file_for_save = $history_file_for_save.'-hist' . DS . $version;
                         $historyFolder = new Folder($history_file_for_save);
                         $historyFolder->create($history_file_for_save);
-                        chmod($history_file_for_save, 0777);
+                        $this->_m9_mode($history_file_for_save);
                         file_put_contents($history_file_for_save . DS . "createdInfo.json", json_encode($json, JSON_PRETTY_PRINT));
                     }else{
 
@@ -1642,20 +1820,25 @@ class QcDocumentsController extends AppController {
 
     public function rename($id = null, $value = null){
         $value = base64_decode($value);
+        // M9 correction 26 (6 Nov 2026): the rename form posts no id, so the document number check and the redirects use the address id
         if ($this->request->is('post') || $this->request->is('put')) {
             $qcDocument = $this->QcDocument->find('first',array('conditions'=>array('QcDocument.id'=>$id),'recursive'=>-1));
             if($qcDocument){
+                $m9orig = $qcDocument['QcDocument']; // M9 correction 28: the stored row, to put back on a failure
+                $m9why = $this->_m9_revision_unchanged(isset($this->request->data['QcDocument']['revision_number']) ? $this->request->data['QcDocument']['revision_number'] : null, $id, true); // M9 correction 22d
+                if ($m9why !== '') { $this->_m9_ac_log('revision_change_refused', 'rename'); $this->Session->setFlash($m9why); $this->redirect(array('action' => 'rename', $id)); }
+                $this->request->data['QcDocument']['revision_number'] = (string)$qcDocument['QcDocument']['revision_number'];
                 if($qcDocument['QcDocument']['document_number'] != $this->request->data['QcDocument']['document_number']){
                     // check if document number exists if changed.
                     $docNumCheck = $this->QcDocument->find('count',array(
                         'conditions'=>array(
                             'QcDocument.document_number'=>$this->request->data['QcDocument']['document_number'],
-                            'QcDocument.id != '=>$this->request->data['QcDocument']['id'],
+                            'QcDocument.id != '=>$id,
                             'QcDocument.standard_id'=>$qcDocument['QcDocument']['standard_id'],
                         )));
                     if($docNumCheck > 0){
                         $this->Session->setFlash(__('Document Number already exists.'));
-                        $this->redirect(array('action' => 'rename',$this->request->data['QcDocument']['id']));
+                        $this->redirect(array('action' => 'rename',$id));
                     }
                 }                
                 //find if the document exists;
@@ -1683,54 +1866,66 @@ class QcDocumentsController extends AppController {
                 $file_name = $file_name. '.' . $file_type;                
                 $newfile = Configure::read('path') . DS . $id . DS . $file_name;
                 if(file_exists($file)){
-                    if(file_exists(Configure::read('path'). DS . 'backups')){
-                    }else{
-                        $backupFolder = New Folder();
-                        if($backupFolder->create(Configure::read('path'). DS . 'backups')){
-                        }else{
-                            // echo 'Unable to create Backup Folder';
-                            $this->Session->setFlash(__('Unable to back the document.'));
-                            $this->redirect(array('action' => 'rename',$this->request->data['QcDocument']['id']));
-                        }
-                    }                    
-                    if(file_exists(Configure::read('path'). DS . 'backups' . DS . $id)){
-                    }else{
-                        $backupFileFolder = New Folder();
-                        if($backupFileFolder->create(Configure::read('path'). DS . 'backups' . DS . $id)){
-                        }
-                    }
-                    // back up existing folder
-                    $folderToCopy = new Folder(Configure::read('path') . DS . $id);
-                    $folderToCopy->copy(array(
-                        'to' => Configure::read('path'). DS . 'backups' . DS . $id,
-                        'from' => Configure::read('path') . DS . $id,
-                        'recursive' => true
-                    ));                    
-                    if(file_exists($file)){
-                        rename($file, $newfile);
-                    }
+                    // M9 correction 28 (owner, 6 Nov 2026): every step is checked, in this order: inputs, name collisions, backup,
+                    // file, history folder, record. A failure puts back what was already done (MyISAM, no transaction), and
+                    // "Document renamed." is shown only when the file, its history folder and the record were all changed.
+                    $m9fail = function ($event, $msg) use ($id) { $this->_m9_ac_log('rename_refused', $event); $this->Session->setFlash($msg); $this->redirect(array('action' => 'rename', $id)); };
+                    $m9in = function ($k) { return (isset($this->request->data['QcDocument'][$k]) && is_scalar($this->request->data['QcDocument'][$k])) ? trim((string)$this->request->data['QcDocument'][$k]) : ''; };
+                    if ($m9in('name') === '' || $m9in('document_number') === '' || $this->_clean_table_names($this->request->data['QcDocument']['name']) === '') $m9fail('input_blank', __('The document name and the document number are required. Nothing was changed.'));
                     $oldfolder = $file.'-hist';
                     $newfolder = $newfile.'-hist';
-                    
-                    if(file_exists($oldfolder)){
-                        rename($oldfolder, $newfolder);
-                    }                 
+                    $m9hist = file_exists($oldfolder) && $newfolder !== $oldfolder;
+                    if ($newfile !== $file && file_exists($newfile)) $m9fail('target_file_exists', __('A file with the new name already exists for this document. Nothing was changed.'));
+                    if ($m9hist && file_exists($newfolder)) $m9fail('target_history_exists', __('A history folder with the new name already exists for this document. Nothing was changed.'));
+                    // back up the existing folder (as before, now checked)
+                    $m9bk = Configure::read('path'). DS . 'backups';
+                    foreach (array($m9bk, $m9bk . DS . $id) as $m9d) { if (false === is_dir($m9d)) { $m9f = new Folder(); if (false === $m9f->create($m9d)) $m9fail('backup_folder', __('Unable to back up the document. Nothing was changed.')); } }
+                    $folderToCopy = new Folder(Configure::read('path') . DS . $id);
+                    if (false === $folderToCopy->copy(array('to' => $m9bk . DS . $id, 'from' => Configure::read('path') . DS . $id, 'recursive' => true))) $m9fail('backup_copy', __('Unable to back up the document. Nothing was changed.'));
+                    $m9fileMoved = false; $m9histMoved = false;
+                    $m9undo = function () use ($file, $newfile, $oldfolder, $newfolder, &$m9fileMoved, &$m9histMoved) {
+                        $ok = true;
+                        if ($m9histMoved) $ok = @rename($newfolder, $oldfolder) && $ok;
+                        if ($m9fileMoved) $ok = @rename($newfile, $file) && $ok;
+                        return $ok;
+                    };
+                    if ($newfile !== $file) {
+                        if (false === @rename($file, $newfile)) $m9fail('file_rename_failed', __('The file could not be renamed. Nothing was changed.'));
+                        $m9fileMoved = true;
+                    }
+                    if ($m9hist) {
+                        if (false === @rename($oldfolder, $newfolder)) {
+                            $m9back = $m9undo();
+                            $this->_m9_ac_log('rename_failed_restored', 'history_rename' . ($m9back ? '' : ' undo_failed'));
+                            $this->Session->setFlash($m9back ? __('The history folder could not be renamed. Nothing was changed.') : __('The history folder could not be renamed and the file could not be put back. Please contact the administrator.'));
+                            $this->redirect(array('action' => 'rename', $id));
+                        }
+                        $m9histMoved = true;
+                    }
                     // update record
                     $qcDocument['QcDocument']['name'] = $this->request->data['QcDocument']['name'];
                     $qcDocument['QcDocument']['title'] = $this->_clean_table_names($this->request->data['QcDocument']['name']);
                     $qcDocument['QcDocument']['document_number'] = $this->request->data['QcDocument']['document_number'];
-                    $qcDocument['QcDocument']['revision_number'] = $this->request->data['QcDocument']['revision_number'];                    
+                    $qcDocument['QcDocument']['revision_number'] = $this->request->data['QcDocument']['revision_number'];
                     $this->QcDocument->create();
-                    $this->QcDocument->save($qcDocument,false);
+                    try { $m9ok = (bool)$this->QcDocument->save($qcDocument,false); } catch (Exception $m9e) { $m9ok = false; } // a database error throws
+                    if (false === $m9ok) {
+                        $m9back = $m9undo();
+                        $m9rec = $this->_m9_put_back('QcDocument', $m9orig);
+                        $this->_m9_ac_log('rename_failed_restored', 'record_save' . ($m9back ? '' : ' undo_failed') . ($m9rec ? '' : ' record_restore_failed:' . $this->m9PutBackDiff));
+                        $this->Session->setFlash(($m9back && $m9rec) ? __('The document record could not be saved. Nothing was changed.') : __('The document record could not be saved and the earlier steps could not all be put back. Please contact the administrator.'));
+                        $this->redirect(array('action' => 'rename', $id));
+                    }
+                    $this->_m9_ac_log('rename_saved', substr((string)$id, 0, 8));
                     $this->Session->setFlash(__('Document renamed.'));
-                    $this->redirect(array('action' => 'view',$this->request->data['QcDocument']['id']));
+                    $this->redirect(array('action' => 'view',$id));
                 }else{
                     $this->Session->setFlash(__('Document does not exists.'));
-                    $this->redirect(array('action' => 'view',$this->request->data['QcDocument']['id']));  
+                    $this->redirect(array('action' => 'view',$id));  
                 }
             }else{
                 $this->Session->setFlash(__('Document does not exists.'));
-                $this->redirect(array('action' => 'view',$this->request->data['QcDocument']['id']));
+                $this->redirect(array('action' => 'view',$id));
             }
         }else{
             $access = $this->request->data['Access'];

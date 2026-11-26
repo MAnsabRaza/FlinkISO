@@ -320,7 +320,7 @@ class StandardsController extends AppController {
                     'conditions'=>array(
                         'User.is_mr'=>1,
                         'User.id'=>$this->Session->read('User.id'),
-                        'User.password'=> Security::hash($this->request->data['Standard']['password'], 'md5', true),                        
+                        'User.password'=> $this->_m9_password_condition(array('User.id'=>$this->Session->read('User.id')), $this->request->data['Standard']['password']),                        
                     )
                 ));
                 
