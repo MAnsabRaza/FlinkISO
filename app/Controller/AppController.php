@@ -343,22 +343,26 @@ class AppController extends Controller {
     // M9 full fix: one writer per target file on this host. The lock file lives under app/tmp/m9_locks
     // (0700) and is held only for the duration of the copy/write, never across a request.
     public function _m9_file_lock($path, $timeout = 10) {
+        // M9 point 1: files and database rows share one write domain. Taking the model write lock here
+        // means a file copy/write can never interleave with a model write, journal on or off.
+        if (false === AppModel::m9_write_lock_acquire($timeout)) return false;
         $dir = TMP . 'm9_locks';
         if (!is_dir($dir)) @mkdir($dir, 0700, true);
         @chmod($dir, 0700);
         $fp = @fopen($dir . DS . sha1((string)$path) . '.lock', 'c');
-        if ($fp === false) return false;
+        if ($fp === false) { AppModel::m9_write_lock_release(); return false; }
         $end = time() + max(1, (int)$timeout);
         do {
             if (flock($fp, LOCK_EX | LOCK_NB)) return $fp;
             usleep(100000);
         } while (time() < $end);
         fclose($fp);
+        AppModel::m9_write_lock_release();
         return false;
     }
 
     public function _m9_file_unlock($lock) {
-        if (is_resource($lock)) { flock($lock, LOCK_UN); fclose($lock); }
+        if (is_resource($lock)) { flock($lock, LOCK_UN); fclose($lock); AppModel::m9_write_lock_release(); }
     }
 
     // ===== Owner's fifth review (16 Nov 2026), decision 393: a copy never follows a symbolic link =====

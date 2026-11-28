@@ -813,42 +813,21 @@ class CustomTablesController extends AppController {
         return $t;
     }
 
-    // M9 full fix: serialise every builder submit on this database. Form builder writes the same
-    // generated files and the same definition rows; a second submit must wait (or be refused) instead
-    // of interleaving its journal, file backups and DDL with the first one.
-    protected function _m9_lock_acquire($name, $timeout = 10) {
-        if (preg_match('/^[A-Za-z0-9_]{1,64}$/', (string)$name) !== 1) return false;
-        try {
-            $q = $this->_m9_tx_pdo()->prepare('SELECT GET_LOCK(?, ?)');
-            $q->execute(array((string)$name, max(1, (int)$timeout)));
-            return ((string)$q->fetchColumn() === '1');
-        } catch (Throwable $e) { return false; }
-    }
-
-    protected function _m9_lock_release($name) {
-        if (!is_string($name) || $name === '') return;
-        try {
-            $q = $this->_m9_tx_pdo()->prepare('SELECT RELEASE_LOCK(?)');
-            $q->execute(array($name));
-        } catch (Throwable $e) { }
-    }
-
     protected function _m9_tx_unlock_files($tx) {
         if (!is_array($tx) || empty($tx['fileLocks'])) return;
         foreach ($tx['fileLocks'] as $lock) $this->_m9_file_unlock($lock);
     }
 
     protected function _m9_tx_release_builder() {
-        $this->_m9_lock_release($this->m9TxLock);
+        if ($this->m9TxLock !== '') AppModel::m9_write_lock_release();
         $this->m9TxLock = '';
     }
 
     public function _m9_tx_begin() {
         if (is_array($this->m9Tx)) throw new M9BuilderAbort('nested_submit');
         if ($this->m9TxLock !== '') throw new M9BuilderAbort('nested_submit');
-        $lock = 'm9_builder';
-        if (false === $this->_m9_lock_acquire($lock, 10)) throw new M9BuilderAbort('builder_busy');
-        $this->m9TxLock = $lock;
+        if (false === AppModel::m9_write_lock_acquire(10)) throw new M9BuilderAbort('builder_busy');
+        $this->m9TxLock = AppModel::m9_write_lock_name();
         try {
             $this->loadModel('ApprovalProcess');
             $this->loadModel('Approval');
@@ -858,8 +837,7 @@ class CustomTablesController extends AppController {
                 'files' => array(), 'ddl' => array(), 'made' => array(), 'noted' => array(), 'stage' => array(), 'created' => array(),
                 'fileLocks' => array(), 'shadow' => array(), 'answer' => '', 'done' => false, 'user' => (string)$this->Session->read('User.id'));
         } catch (Throwable $e) {
-            $this->_m9_lock_release($lock);
-            $this->m9TxLock = '';
+            $this->_m9_tx_release_builder();
             throw $e;
         }
         if (false === $this->m9TxShutdown) { $this->m9TxShutdown = true; register_shutdown_function(array($this, '_m9_tx_shutdown')); }
@@ -992,7 +970,7 @@ class CustomTablesController extends AppController {
     // statement per change and ignored the ones the database refused (dropping a column that is not there, adding one that is);
     // those are not issued here, so the one ALTER does exactly what FlinkISO's statements that succeeded did.
     protected function _m9_tx_plan($cols, $lists) {
-        $clauses = array(); $expect = array();
+        $clauses = array(); $expect = array(); $map = array();
         foreach ($lists as $fields) foreach ($fields as $f) {
             $name = isset($f['field_name']) ? (string)$f['field_name'] : '';
             if ($name === '' || in_array($name, $this->reserved_fields, true)) continue;
@@ -1006,6 +984,8 @@ class CustomTablesController extends AppController {
                 continue;
             }
             if (!$new && $old !== '' && $old !== $name && isset($cols[$old]) && !isset($cols[$name])) {
+                if (isset($map[$old]) && $map[$old] !== $name) throw new M9BuilderAbort('conflicting_field_rename ' . $old);
+                $map[$old] = $name;
                 $clauses[] = 'CHANGE `' . $this->_m9_tx_ident($old) . '` `' . $this->_m9_tx_ident($name) . '` ' . $this->_m9_tx_type($f) . ' ' . $null;
                 unset($cols[$old]); $cols[$name] = true; $expect[$old] = false; $expect[$name] = true;
             }
@@ -1015,7 +995,7 @@ class CustomTablesController extends AppController {
                 $cols[$name] = true; $expect[$name] = true;
             }
         }
-        return array($clauses, $expect);
+        return array($clauses, $expect, $map);
     }
 
     protected function _m9_tx_shadow_name($t, $tag = 's') {
@@ -1029,23 +1009,50 @@ class CustomTablesController extends AppController {
         } catch (Throwable $e) { return false; }
     }
 
-    // The rows of the original table are copied into the empty shadow table. If anything changes
-    // while the copy is in progress the row count/checksum differs and the submit stops before the
-    // original schema or data is touched.
-    protected function _m9_tx_copy_rows($from, $to) {
+    // The rows of the original table are copied into the empty shadow table. Renamed columns are copied
+    // through the explicit old -> new map built by _m9_tx_plan; name matching is only used for columns
+    // that kept their name. Before the RENAME the copy is verified column by column, so a rename can
+    // neither lose its old column's values nor hide a row another request changed.
+    protected function _m9_tx_copy_rows($from, $to, $map = array()) {
         $a = $this->_m9_tx_columns($from); $b = $this->_m9_tx_columns($to);
-        $common = array();
-        foreach (array_keys($a) as $c) if (isset($b[$c])) $common[] = '`' . str_replace('`', '', $c) . '`';
-        if (!$common) throw new M9BuilderAbort('no_common_columns ' . $from);
-        $this->_m9_tx_ddl_run('INSERT INTO `' . $to . '` (' . implode(', ', $common) . ') SELECT ' . implode(', ', $common) . ' FROM `' . $from . '`', 'copy ' . $from . ' to ' . $to);
+        $src = array(); $dst = array(); $used = array();
+        foreach ($map as $old => $new) {
+            if (!isset($a[$old])) throw new M9BuilderAbort('rename_source_missing ' . $from . '.' . $old);
+            if (!isset($b[$new])) throw new M9BuilderAbort('rename_target_missing ' . $to . '.' . $new);
+            $src[] = '`' . str_replace('`', '', $old) . '`';
+            $dst[] = '`' . str_replace('`', '', $new) . '`';
+            $used[$new] = true;
+        }
+        foreach (array_keys($a) as $c) {
+            $d = isset($map[$c]) ? $map[$c] : $c;
+            if (isset($used[$d])) continue;
+            if (isset($b[$d])) {
+                $src[] = '`' . str_replace('`', '', $c) . '`';
+                $dst[] = '`' . str_replace('`', '', $d) . '`';
+                $used[$d] = true;
+            }
+        }
+        if (!$src) throw new M9BuilderAbort('no_common_columns ' . $from);
+        $this->_m9_tx_ddl_run('INSERT INTO `' . $to . '` (' . implode(', ', $dst) . ') SELECT ' . implode(', ', $src) . ' FROM `' . $from . '`', 'copy ' . $from . ' to ' . $to);
         $pdo = $this->_m9_tx_pdo();
         $n1 = (int)$pdo->query('SELECT COUNT(*) FROM `' . $from . '`')->fetchColumn();
         $n2 = (int)$pdo->query('SELECT COUNT(*) FROM `' . $to . '`')->fetchColumn();
         if ($n1 !== $n2) throw new M9BuilderAbort('row_count_changed ' . $from);
-        $c1 = $pdo->query('CHECKSUM TABLE `' . $from . '`')->fetch(PDO::FETCH_ASSOC);
-        $c2 = $pdo->query('CHECKSUM TABLE `' . $to . '`')->fetch(PDO::FETCH_ASSOC);
-        if (is_array($c1) && is_array($c2) && isset($c1['Checksum'], $c2['Checksum']) && $c1['Checksum'] !== null && $c2['Checksum'] !== null && (string)$c1['Checksum'] !== (string)$c2['Checksum']) {
-            throw new M9BuilderAbort('row_checksum_changed ' . $from);
+        $pk = isset($a['id']) && isset($b['id']) ? 'id' : (isset($a['sr_no']) && isset($b['sr_no']) ? 'sr_no' : null);
+        if ($pk !== null) {
+            $where = array('t.`' . $pk . '` IS NULL');
+            foreach ($src as $i => $s) {
+                $sc = trim($s, '`'); $dc = trim($dst[$i], '`');
+                $where[] = 'NOT (f.`' . $sc . '` <=> t.`' . $dc . '`)';
+            }
+            $sql = 'SELECT COUNT(*) FROM `' . $from . '` f LEFT JOIN `' . $to . '` t ON f.`' . $pk . '` = t.`' . $pk . '` WHERE ' . implode(' OR ', $where);
+            if ((int)$pdo->query($sql)->fetchColumn() !== 0) throw new M9BuilderAbort('row_data_changed ' . $from);
+        } else {
+            $c1 = $pdo->query('CHECKSUM TABLE `' . $from . '`')->fetch(PDO::FETCH_ASSOC);
+            $c2 = $pdo->query('CHECKSUM TABLE `' . $to . '`')->fetch(PDO::FETCH_ASSOC);
+            if (is_array($c1) && is_array($c2) && isset($c1['Checksum'], $c2['Checksum']) && $c1['Checksum'] !== null && $c2['Checksum'] !== null && (string)$c1['Checksum'] !== (string)$c2['Checksum']) {
+                throw new M9BuilderAbort('row_checksum_changed ' . $from);
+            }
         }
         return true;
     }
@@ -1069,7 +1076,7 @@ class CustomTablesController extends AppController {
         foreach ($this->m9Tx['ddl'] as $p) if ($p['alter'] !== '' && !empty($p['fields'])) $byTable[$p['alter']][] = $p['fields'];
         foreach ($byTable as $t => $lists) {
             $before = $this->_m9_tx_columns($t);
-            list($clauses, $expect) = $this->_m9_tx_plan($before, $lists);
+            list($clauses, $expect, $map) = $this->_m9_tx_plan($before, $lists);
             if (!$clauses) continue;
             $shadow = $this->_m9_tx_shadow_name($t, 's');
             $backup = $this->_m9_tx_shadow_name($t, 'b');
@@ -1082,10 +1089,15 @@ class CustomTablesController extends AppController {
                 $after = $this->_m9_tx_columns($shadow); $hit = 0;
                 foreach ($expect as $c => $present) if (isset($after[$c]) === $present) $hit++;
                 if ($hit !== count($expect)) throw new M9BuilderAbort('table_not_as_expected ' . $t);
-                $this->_m9_tx_copy_rows($t, $shadow);
-                $this->_m9_tx_ddl_run('RENAME TABLE `' . $t . '` TO `' . $backup . '`, `' . $shadow . '` TO `' . $t . '`', 'shadow rename ' . $t);
-                $this->m9Tx['shadow'][$t]['done'] = true;
-                if (!$this->_m9_tx_table_exists($t) || !$this->_m9_tx_table_exists($backup) || $this->_m9_tx_table_exists($shadow)) throw new M9BuilderAbort('table_rename_failed ' . $t);
+                if (false === AppModel::m9_write_fence_enter()) throw new M9BuilderAbort('write_fence_unavailable ' . $t);
+                try {
+                    $this->_m9_tx_copy_rows($t, $shadow, $map);
+                    $this->_m9_tx_ddl_run('RENAME TABLE `' . $t . '` TO `' . $backup . '`, `' . $shadow . '` TO `' . $t . '`', 'shadow rename ' . $t);
+                    $this->m9Tx['shadow'][$t]['done'] = true;
+                    if (!$this->_m9_tx_table_exists($t) || !$this->_m9_tx_table_exists($backup) || $this->_m9_tx_table_exists($shadow)) throw new M9BuilderAbort('table_rename_failed ' . $t);
+                } finally {
+                    AppModel::m9_write_fence_leave();
+                }
                 $sum[] = 'alter:' . $t . ':' . count($clauses);
             } catch (Throwable $e) {
                 if (!$this->m9Tx['shadow'][$t]['done']) $this->_m9_tx_drop($shadow, 'shadow cleanup ' . $t);
@@ -1102,9 +1114,14 @@ class CustomTablesController extends AppController {
             if ($state['done']) {
                 $quarantine = $this->_m9_tx_shadow_name($t, 'q');
                 $this->_m9_tx_drop($quarantine, 'stale quarantine');
-                $this->_m9_tx_ddl_run('RENAME TABLE `' . $t . '` TO `' . $quarantine . '`, `' . $backup . '` TO `' . $t . '`', 'shadow restore ' . $t);
-                if ($this->_m9_tx_table_exists($backup) || !$this->_m9_tx_table_exists($t)) throw new M9BuilderAbort('restore_failed ' . $t);
-                $this->_m9_tx_drop($quarantine, 'discard altered ' . $t);
+                if (false === AppModel::m9_write_fence_enter()) throw new M9BuilderAbort('write_fence_unavailable ' . $t);
+                try {
+                    $this->_m9_tx_ddl_run('RENAME TABLE `' . $t . '` TO `' . $quarantine . '`, `' . $backup . '` TO `' . $t . '`', 'shadow restore ' . $t);
+                    if ($this->_m9_tx_table_exists($backup) || !$this->_m9_tx_table_exists($t)) throw new M9BuilderAbort('restore_failed ' . $t);
+                    $this->_m9_tx_drop($quarantine, 'discard altered ' . $t);
+                } finally {
+                    AppModel::m9_write_fence_leave();
+                }
                 $undone++;
             } else {
                 $this->_m9_tx_drop($shadow, 'discard shadow ' . $t);
@@ -1144,7 +1161,8 @@ class CustomTablesController extends AppController {
             $tmp = $dir . DS . '.m9b_' . $this->m9Tx['id'] . '_' . ($i++) . '.tmp';
             $h = @fopen($tmp, 'xb');
             if ($h === false) throw new M9BuilderAbort('file_not_written ' . $rel);
-            $this->m9Tx['stage'][$rel] = array('tmp' => $tmp, 'target' => $target, 'backup' => null, 'placed' => false);
+            $this->m9Tx['stage'][$rel] = array('tmp' => $tmp, 'target' => $target, 'backup' => null, 'placed' => false,
+                'hash' => hash('sha256', $content));
             $n = fwrite($h, $content); fflush($h); fclose($h);
             clearstatcache(true, $tmp);
             if ($n !== strlen($content) || @file_get_contents($tmp) !== $content) throw new M9BuilderAbort('file_not_written ' . $rel);
@@ -1197,9 +1215,14 @@ class CustomTablesController extends AppController {
                     if ($n === 0) { $this->_m9_tx_ddl_run('DROP TABLE `' . $t . '`', 'undo ' . $t); $undone++; } else $bad[] = 'table_kept:' . $t;
                 } catch (Exception $e) { $bad[] = 'table_not_dropped:' . $t; }
             }
-            // files: put back what was replaced, remove what was new, remove temporary files
+            // files: put back what was replaced, remove what was new, remove temporary files. A file is only
+            // touched while it still has the exact bytes this submit placed there; a file another operation
+            // changed after that is kept and reported instead of being overwritten or deleted.
             foreach (array_reverse($tx['stage'], true) as $rel => $s) {
                 if (!$s['placed']) { @unlink($s['tmp']); continue; }
+                $expect = isset($s['hash']) ? (string)$s['hash'] : '';
+                $cur = (is_file($s['target']) && !is_link($s['target'])) ? hash_file('sha256', $s['target']) : null;
+                if ($expect === '' || $cur !== $expect) { $bad[] = 'file_kept_changed:' . $rel; continue; }
                 if ($s['backup'] !== null) {
                     $r = dirname($s['target']) . DS . '.m9r_' . $tx['id'] . '.tmp';
                     $ok = @copy($s['backup'], $r) && @rename($r, $s['target']) && hash_file('sha256', $s['target']) === hash_file('sha256', $s['backup']);

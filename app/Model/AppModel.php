@@ -23,6 +23,7 @@
 
 App::uses("Model", "Model");
 App::uses('ClassRegistry', 'Utility');
+App::uses('ConnectionManager', 'Model');
 /**
  * Application model for Cake.
  *
@@ -336,6 +337,65 @@ class AppModel extends Model
     // (logged as other=) and, as in revision 9, not undone.
     public static $m9Journal = null;
 
+    // M9 point 1: one write lock for every model write and for every file lock. It is independent of
+    // the builder journal, so a normal request cannot bypass the lock that a builder submit holds.
+    public static $m9WriteLockDepth = 0;
+    public static $m9WriteLockName = '';
+    public static $m9WriteFence = 0;
+
+    public static function m9_write_lock_name() {
+        $db = '';
+        try { $db = (string)ConnectionManager::getDataSource('default')->getConnection()->query('SELECT DATABASE()')->fetchColumn(); } catch (Throwable $e) { }
+        return 'm9w_' . substr(sha1($db === '' ? 'default' : $db), 0, 32);
+    }
+
+    public static function m9_write_lock_acquire($timeout = 10) {
+        if (self::$m9WriteLockDepth > 0) { self::$m9WriteLockDepth++; return true; }
+        try {
+            $pdo = ConnectionManager::getDataSource('default')->getConnection();
+            $name = self::m9_write_lock_name();
+            $q = $pdo->prepare('SELECT GET_LOCK(?, ?)');
+            $q->execute(array($name, max(1, (int)$timeout)));
+            if ((string)$q->fetchColumn() !== '1') return false;
+            self::$m9WriteLockName = $name;
+            self::$m9WriteLockDepth = 1;
+            return true;
+        } catch (Throwable $e) { return false; }
+    }
+
+    public static function m9_write_lock_release() {
+        if (self::$m9WriteLockDepth <= 0) return;
+        self::$m9WriteLockDepth--;
+        if (self::$m9WriteLockDepth > 0) return;
+        try {
+            $pdo = ConnectionManager::getDataSource('default')->getConnection();
+            $q = $pdo->prepare('SELECT RELEASE_LOCK(?)');
+            $q->execute(array(self::$m9WriteLockName));
+        } catch (Throwable $e) { }
+        self::$m9WriteLockName = '';
+        self::$m9WriteFence = 0;
+    }
+
+    public static function m9_write_lock_depth() {
+        return self::$m9WriteLockDepth;
+    }
+
+    // Held across the final row verification and RENAME TABLE. Every write path needs the same lock,
+    // so this is an explicit fence on top of the already-held exclusive write lock.
+    public static function m9_write_fence_enter() {
+        if (self::$m9WriteLockDepth < 1) return false;
+        self::$m9WriteFence++;
+        return true;
+    }
+
+    public static function m9_write_fence_leave() {
+        if (self::$m9WriteFence > 0) self::$m9WriteFence--;
+    }
+
+    public static function m9_write_fence_active() {
+        return self::$m9WriteFence > 0;
+    }
+
     public static function m9_journal_start($tables) {
         $t = array();
         foreach ((array)$tables as $x) if (is_string($x) && preg_match('/^[A-Za-z0-9_]{1,64}$/', $x) === 1) $t[$x] = true;
@@ -366,28 +426,6 @@ class AppModel extends Model
 
     public function _m9_jr_pdo() {
         return $this->getDataSource()->getConnection();
-    }
-
-    // M9 full fix: serialize writes to one builder table across requests/threads. MyISAM has no row
-    // locks, so an advisory lock keyed to the table stands in for the row lock; optimistic concurrency
-    // (the before/last snapshots and conditional writes) remains the second line of defence.
-    protected function _m9_jr_lock_name() {
-        return 'm9tbl_' . md5($this->_m9_jr_table());
-    }
-
-    protected function _m9_jr_lock_acquire($timeout = 10) {
-        try {
-            $q = $this->_m9_jr_pdo()->prepare('SELECT GET_LOCK(?, ?)');
-            $q->execute(array($this->_m9_jr_lock_name(), max(1, (int)$timeout)));
-            return ((string)$q->fetchColumn() === '1');
-        } catch (Throwable $e) { return false; }
-    }
-
-    protected function _m9_jr_lock_release() {
-        try {
-            $q = $this->_m9_jr_pdo()->prepare('SELECT RELEASE_LOCK(?)');
-            $q->execute(array($this->_m9_jr_lock_name()));
-        } catch (Throwable $e) { }
     }
 
     // the rows with these ids as stored now, read directly (no cache, no callbacks)
@@ -456,9 +494,9 @@ class AppModel extends Model
     }
 
     public function save($data = null, $validate = true, $fieldList = array()) {
-        if (false === $this->_m9_jr_on()) return $this->_m9_save_guarded($data, $validate, $fieldList);
-        if (false === $this->_m9_jr_lock_acquire(10)) return false;
+        if (false === self::m9_write_lock_acquire(10)) return false;
         try {
+            if (false === $this->_m9_jr_on()) return $this->_m9_save_guarded($data, $validate, $fieldList);
             $id = $this->_m9_jr_save_id($data);
             if ($id !== null) $this->_m9_jr_before(array($id));
             try { $r = $this->_m9_save_guarded($data, $validate, $fieldList); }
@@ -469,49 +507,68 @@ class AppModel extends Model
             }
             return $r;
         } finally {
-            $this->_m9_jr_lock_release();
+            self::m9_write_lock_release();
         }
     }
 
+    public function saveAll($data = array(), $options = array()) {
+        if (false === self::m9_write_lock_acquire(10)) return false;
+        try { return parent::saveAll($data, $options); } finally { self::m9_write_lock_release(); }
+    }
+
+    public function saveMany($data = null, $options = array()) {
+        if (false === self::m9_write_lock_acquire(10)) return false;
+        try { return parent::saveMany($data, $options); } finally { self::m9_write_lock_release(); }
+    }
+
+    public function saveAssociated($data = null, $options = array()) {
+        if (false === self::m9_write_lock_acquire(10)) return false;
+        try { return parent::saveAssociated($data, $options); } finally { self::m9_write_lock_release(); }
+    }
+
     public function updateAll($fields, $conditions = true) {
-        if (false === $this->_m9_jr_on()) return $this->_m9_updateAll_guarded($fields, $conditions);
-        $ids = $this->_m9_jr_ids($conditions);
-        if ($ids === null) { self::$m9Journal['raw'][] = $this->_m9_jr_table() . ' updateAll'; return false; }
-        if (false === $this->_m9_jr_lock_acquire(10)) return false;
+        if (false === self::m9_write_lock_acquire(10)) return false;
         try {
+            if (false === $this->_m9_jr_on()) return $this->_m9_updateAll_guarded($fields, $conditions);
+            // select the affected ids only while the write lock is held: no row can enter or leave
+            // the condition set between this read and the update, so the journal cannot record the wrong rows
+            $ids = $this->_m9_jr_ids($conditions);
+            if ($ids === null) { self::$m9Journal['raw'][] = $this->_m9_jr_table() . ' updateAll'; return false; }
             $this->_m9_jr_before($ids);
             try { $r = $this->_m9_updateAll_guarded($fields, $conditions); } finally { $this->_m9_jr_after($ids); }
             return $r;
         } finally {
-            $this->_m9_jr_lock_release();
+            self::m9_write_lock_release();
         }
     }
 
     public function delete($id = null, $cascade = true) {
-        if (false === $this->_m9_jr_on()) return $this->_m9_delete_guarded($id, $cascade);
-        $one = ($id === null || $id === false || $id === '' || $id === array()) ? $this->id : $id; if (is_array($one)) $one = count($one) === 1 ? reset($one) : null;
-        $ids = ($one === null || $one === false || $one === '') ? array() : array((string)$one);
-        if (false === $this->_m9_jr_lock_acquire(10)) return false;
+        if (false === self::m9_write_lock_acquire(10)) return false;
         try {
+            if (false === $this->_m9_jr_on()) return $this->_m9_delete_guarded($id, $cascade);
+            $one = ($id === null || $id === false || $id === '' || $id === array()) ? $this->id : $id; if (is_array($one)) $one = count($one) === 1 ? reset($one) : null;
+            $ids = ($one === null || $one === false || $one === '') ? array() : array((string)$one);
             $this->_m9_jr_before($ids);
             try { $r = $this->_m9_delete_guarded($id, $cascade); } finally { $this->_m9_jr_after($ids); }
             return $r;
         } finally {
-            $this->_m9_jr_lock_release();
+            self::m9_write_lock_release();
         }
     }
 
     public function deleteAll($conditions, $cascade = true, $callbacks = false) {
-        if (false === $this->_m9_jr_on()) return $this->_m9_deleteAll_guarded($conditions, $cascade, $callbacks);
-        $ids = $this->_m9_jr_ids($conditions);
-        if ($ids === null) { self::$m9Journal['raw'][] = $this->_m9_jr_table() . ' deleteAll'; return false; }
-        if (false === $this->_m9_jr_lock_acquire(10)) return false;
+        if (false === self::m9_write_lock_acquire(10)) return false;
         try {
+            if (false === $this->_m9_jr_on()) return $this->_m9_deleteAll_guarded($conditions, $cascade, $callbacks);
+            // select the affected ids only while the write lock is held: no row can enter or leave
+            // the condition set between this read and the delete, so the journal cannot record the wrong rows
+            $ids = $this->_m9_jr_ids($conditions);
+            if ($ids === null) { self::$m9Journal['raw'][] = $this->_m9_jr_table() . ' deleteAll'; return false; }
             $this->_m9_jr_before($ids);
             try { $r = $this->_m9_deleteAll_guarded($conditions, $cascade, $callbacks); } finally { $this->_m9_jr_after($ids); }
             return $r;
         } finally {
-            $this->_m9_jr_lock_release();
+            self::m9_write_lock_release();
         }
     }
 
